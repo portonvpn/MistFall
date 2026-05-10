@@ -21,7 +21,6 @@ export interface GroundData {
   getHeightAt: (x: number, z: number) => number;
 }
 
-// Seeded PRNG for consistent world generation across all devices
 class SeededRandom {
   private seed: number;
   constructor(seed: number) { this.seed = seed; }
@@ -34,11 +33,15 @@ class SeededRandom {
 
 export class WorldGenerator {
   private size = 200;
-  private segments = 100;
+  private segments: number;
   private rng: SeededRandom;
+  private mobile: boolean;
 
-  constructor(seed: number = 42) {
+  constructor(seed: number = 42, mobile: boolean = false) {
     this.rng = new SeededRandom(seed);
+    this.mobile = mobile;
+    // Much lower resolution terrain on mobile
+    this.segments = mobile ? 50 : 100;
   }
 
   private noise(x: number, z: number): number {
@@ -47,7 +50,7 @@ export class WorldGenerator {
     let e = Math.sin(nx * 0.8) * Math.cos(nz * 0.8) * 4.0;
     e += Math.sin(nx * 2.0 + 0.5) * Math.cos(nz * 2.0 - 0.3) * 1.8;
     e += Math.sin(nx * 5.0) * Math.cos(nz * 5.0) * 0.5;
-    e += Math.sin(nx * 12.0) * Math.cos(nz * 12.0) * 0.15;
+    if (!this.mobile) e += Math.sin(nx * 12.0) * Math.cos(nz * 12.0) * 0.15;
     const riverPath = Math.sin(z * 0.05) * 20.0 + Math.sin(z * 0.02) * 10.0;
     const riverDist = Math.abs(x - riverPath);
     if (riverDist < 12) { e -= (1 - riverDist / 12) * 3.5; }
@@ -85,19 +88,25 @@ export class WorldGenerator {
     terrainGeo.computeVertexNormals();
     const terrainMat = new THREE.MeshPhongMaterial({ vertexColors: true, flatShading: true, shininess: 10 });
     const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
-    terrainMesh.receiveShadow = true; terrainMesh.castShadow = true;
+    terrainMesh.receiveShadow = !this.mobile; terrainMesh.castShadow = false;
     const getHeightAt = (x: number, z: number): number => {
       if (Math.abs(x) > this.size / 2 || Math.abs(z) > this.size / 2) return 15;
       return this.noise(x, z);
     };
-    const waterGeo = new THREE.PlaneGeometry(this.size, this.size, 60, 60);
+
+    const waterSegs = this.mobile ? 24 : 60;
+    const waterGeo = new THREE.PlaneGeometry(this.size, this.size, waterSegs, waterSegs);
     waterGeo.rotateX(-Math.PI / 2);
     const waterMesh = new THREE.Mesh(waterGeo, createWaterMaterial());
     waterMesh.position.y = -1.3;
 
+    // Reduce object counts on mobile
+    const m = this.mobile ? 0.4 : 1;
+
     // Trees
     const treeTypes: ('oak' | 'pine' | 'birch' | 'willow' | 'cherry' | 'dead')[] = ['oak', 'pine', 'birch', 'oak', 'pine', 'willow', 'cherry', 'dead'];
-    for (let i = 0; i < 350; i++) {
+    const numTrees = Math.floor(350 * m);
+    for (let i = 0; i < numTrees; i++) {
       const tx = (this.rng.next() - 0.5) * this.size * 0.88;
       const tz = (this.rng.next() - 0.5) * this.size * 0.88;
       const ty = getHeightAt(tx, tz);
@@ -109,8 +118,12 @@ export class WorldGenerator {
         items.push({ id: `tree_${i}`, type: 'tree', mesh: treeMesh, position: new THREE.Vector3(tx, ty, tz), health: 100, maxHealth: 100 });
       }
     }
+    // If mobile, consume remaining RNG calls to keep seed in sync for rocks etc.
+    if (this.mobile) { for (let i = numTrees; i < 350; i++) { this.rng.next(); this.rng.next(); this.rng.next(); this.rng.next(); } }
+
     // Rocks
-    for (let i = 0; i < 150; i++) {
+    const numRocks = Math.floor(150 * m);
+    for (let i = 0; i < numRocks; i++) {
       const rx = (this.rng.next() - 0.5) * this.size * 0.85;
       const rz = (this.rng.next() - 0.5) * this.size * 0.85;
       const ry = getHeightAt(rx, rz);
@@ -123,89 +136,112 @@ export class WorldGenerator {
         items.push({ id: `rock_${i}`, type: 'rock', mesh: rockMesh, position: new THREE.Vector3(rx, ry, rz), health: 80, maxHealth: 80 });
       }
     }
-    // Flowers
+    if (this.mobile) { for (let i = numRocks; i < 150; i++) { this.rng.next(); this.rng.next(); this.rng.next(); this.rng.next(); this.rng.next(); } }
+
+    // Flowers - skip on mobile entirely (decorative only)
+    const numFlowers = this.mobile ? 0 : 200;
     const flowerColors: ('pink' | 'yellow' | 'white' | 'blue')[] = ['pink', 'yellow', 'white', 'blue'];
     for (let i = 0; i < 200; i++) {
       const fx = (this.rng.next() - 0.5) * this.size * 0.8;
       const fz = (this.rng.next() - 0.5) * this.size * 0.8;
       const fy = getHeightAt(fx, fz);
-      if (fy > 0 && fy < 3.5) {
-        const colorType = flowerColors[Math.floor(this.rng.next() * flowerColors.length)];
+      const sc = this.rng.next();
+      const ci = this.rng.next();
+      if (i < numFlowers && fy > 0 && fy < 3.5) {
+        const colorType = flowerColors[Math.floor(ci * flowerColors.length)];
         const flowerMesh = createFlowerModel(colorType);
-        flowerMesh.position.set(fx, fy, fz); flowerMesh.rotation.y = this.rng.next() * Math.PI * 2;
-        flowerMesh.scale.setScalar(0.8 + this.rng.next() * 0.4);
+        flowerMesh.position.set(fx, fy, fz); flowerMesh.rotation.y = sc * Math.PI * 2;
+        flowerMesh.scale.setScalar(0.8 + sc * 0.4);
         items.push({ id: `flower_${i}`, type: 'flower', mesh: flowerMesh, position: new THREE.Vector3(fx, fy, fz), health: 10, maxHealth: 10 });
       }
     }
+
     // Carrots
+    const numCarrots = Math.floor(60 * m);
     for (let i = 0; i < 60; i++) {
       const cx = (this.rng.next() - 0.5) * this.size * 0.7;
       const cz = (this.rng.next() - 0.5) * this.size * 0.7;
       const cy = getHeightAt(cx, cz);
-      if (cy > 0.5 && cy < 3.0) {
+      const rot = this.rng.next();
+      if (i < numCarrots && cy > 0.5 && cy < 3.0) {
         const carrotMesh = createCarrotModel();
-        carrotMesh.position.set(cx, cy, cz); carrotMesh.rotation.y = this.rng.next() * Math.PI * 2;
+        carrotMesh.position.set(cx, cy, cz); carrotMesh.rotation.y = rot * Math.PI * 2;
         items.push({ id: `carrot_${i}`, type: 'carrot', mesh: carrotMesh, position: new THREE.Vector3(cx, cy, cz), health: 5, maxHealth: 5 });
       }
     }
+
     // Mushrooms
+    const numMush = Math.floor(80 * m);
     for (let i = 0; i < 80; i++) {
       const mx = (this.rng.next() - 0.5) * this.size * 0.75;
       const mz = (this.rng.next() - 0.5) * this.size * 0.75;
       const my = getHeightAt(mx, mz);
-      if (my > 0 && my < 3.0) {
-        const mush = createMushroomModel(this.rng.next() > 0.6 ? 'blue' : 'red');
-        mush.position.set(mx, my, mz); mush.rotation.y = this.rng.next() * Math.PI * 2;
-        mush.scale.setScalar(0.7 + this.rng.next() * 0.6);
+      const col = this.rng.next();
+      const rot = this.rng.next();
+      const sc = this.rng.next();
+      if (i < numMush && my > 0 && my < 3.0) {
+        const mush = createMushroomModel(col > 0.6 ? 'blue' : 'red');
+        mush.position.set(mx, my, mz); mush.rotation.y = rot * Math.PI * 2;
+        mush.scale.setScalar(0.7 + sc * 0.6);
         items.push({ id: `mush_${i}`, type: 'mushroom', mesh: mush, position: new THREE.Vector3(mx, my, mz), health: 5, maxHealth: 5 });
       }
     }
+
     // Berry bushes
+    const numBerry = Math.floor(40 * m);
     for (let i = 0; i < 40; i++) {
       const bx = (this.rng.next() - 0.5) * this.size * 0.7;
       const bz = (this.rng.next() - 0.5) * this.size * 0.7;
       const by = getHeightAt(bx, bz);
-      if (by > 0.5 && by < 3.5) {
+      if (i < numBerry && by > 0.5 && by < 3.5) {
         const bush = createBerryBush();
         bush.position.set(bx, by, bz);
         items.push({ id: `berry_${i}`, type: 'berryBush', mesh: bush, position: new THREE.Vector3(bx, by, bz), health: 50, maxHealth: 50 });
       }
     }
+
     // Crystals
+    const numCrystal = Math.floor(25 * m);
     for (let i = 0; i < 25; i++) {
       const cx = (this.rng.next() - 0.5) * this.size * 0.6;
       const cz = (this.rng.next() - 0.5) * this.size * 0.6;
       const cy = getHeightAt(cx, cz);
-      if (cy > 0 && cy < 4.0) {
+      if (i < numCrystal && cy > 0 && cy < 4.0) {
         const crystal = createCrystalModel();
         crystal.position.set(cx, cy, cz);
         items.push({ id: `crystal_${i}`, type: 'crystal', mesh: crystal, position: new THREE.Vector3(cx, cy, cz), health: 30, maxHealth: 30 });
       }
     }
+
     // Loot Chests
+    const numChest = Math.floor(15 * m);
     for (let i = 0; i < 15; i++) {
       const lx = (this.rng.next() - 0.5) * this.size * 0.65;
       const lz = (this.rng.next() - 0.5) * this.size * 0.65;
       const ly = getHeightAt(lx, lz);
-      if (ly > 0 && ly < 4.0) {
+      const rot = this.rng.next();
+      if (i < numChest && ly > 0 && ly < 4.0) {
         const chest = createLootChest();
-        chest.position.set(lx, ly, lz); chest.rotation.y = this.rng.next() * Math.PI * 2;
+        chest.position.set(lx, ly, lz); chest.rotation.y = rot * Math.PI * 2;
         items.push({ id: `chest_${i}`, type: 'lootChest', mesh: chest, position: new THREE.Vector3(lx, ly, lz), health: 50, maxHealth: 50 });
       }
     }
-    // Grass group (visual only)
+
+    // Grass - skip entirely on mobile
     const grassGroup = new THREE.Group();
-    const grassGeo = new THREE.PlaneGeometry(0.15, 0.3);
-    const grassMat = new THREE.MeshLambertMaterial({ color: 0x3a6b30, side: THREE.DoubleSide });
-    for (let i = 0; i < 800; i++) {
-      const gx = (this.rng.next() - 0.5) * this.size * 0.85;
-      const gz = (this.rng.next() - 0.5) * this.size * 0.85;
-      const gy = getHeightAt(gx, gz);
-      if (gy > 0 && gy < 4.0) {
-        const blade = new THREE.Mesh(grassGeo, grassMat);
-        blade.position.set(gx, gy + 0.15, gz);
-        blade.rotation.y = this.rng.next() * Math.PI;
-        grassGroup.add(blade);
+    if (!this.mobile) {
+      const grassGeo = new THREE.PlaneGeometry(0.15, 0.3);
+      const grassMat = new THREE.MeshLambertMaterial({ color: 0x3a6b30, side: THREE.DoubleSide });
+      for (let i = 0; i < 800; i++) {
+        const gx = (this.rng.next() - 0.5) * this.size * 0.85;
+        const gz = (this.rng.next() - 0.5) * this.size * 0.85;
+        const gy = getHeightAt(gx, gz);
+        if (gy > 0 && gy < 4.0) {
+          const blade = new THREE.Mesh(grassGeo, grassMat);
+          blade.position.set(gx, gy + 0.15, gz);
+          blade.rotation.y = this.rng.next() * Math.PI;
+          grassGroup.add(blade);
+        }
       }
     }
     return { terrainMesh, waterMesh, items, grassGroup, worldSize: this.size, getHeightAt };

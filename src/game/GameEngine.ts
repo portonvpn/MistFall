@@ -55,13 +55,12 @@ export class GameEngine {
   private rainParticles!: THREE.Points;
   private fireflyParticles!: THREE.Points;
   private fireflyMaterial!: THREE.ShaderMaterial;
-  private leafParticles!: THREE.Points;
-  private dustParticles!: THREE.Points;
-  private dustMaterial!: THREE.ShaderMaterial;
+  private leafParticles!: THREE.Points | null;
+  private dustParticles!: THREE.Points | null;
+  private dustMaterial!: THREE.ShaderMaterial | null;
   private skyMesh!: THREE.Mesh;
   private skyMaterial!: THREE.ShaderMaterial;
   private waterMaterial!: THREE.ShaderMaterial;
-  private fogPlanes: THREE.Mesh[] = [];
   private animals: Animal[] = [];
   private enemies: Enemy[] = [];
   private droppedItems: DroppedItem[] = [];
@@ -101,6 +100,17 @@ export class GameEngine {
   private isMobile: boolean;
   private worldSeed: number;
 
+  // Reusable vectors to avoid GC pressure
+  private _fwd = new THREE.Vector3();
+  private _right = new THREE.Vector3();
+  private _mv = new THREE.Vector3();
+  private _dir = new THREE.Vector3();
+  private _tmpV = new THREE.Vector3();
+  private _yAxis = new THREE.Vector3(0, 1, 0);
+
+  // Frame skip for mobile
+  private frameCount = 0;
+
   constructor(container: HTMLElement, config: GameConfig, onUpdateHUD: () => void, onAlert: (msg: string) => void, seed: number = 42) {
     this.container = container;
     this.config = config;
@@ -111,20 +121,19 @@ export class GameEngine {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0a1510);
-    this.fog = new THREE.FogExp2(0x1a2820, 0.015);
+    this.fog = new THREE.FogExp2(0x1a2820, this.isMobile ? 0.025 : 0.015);
     this.scene.fog = this.fog;
-    this.camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 250);
+    this.camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.5, this.isMobile ? 120 : 250);
 
-    // Mobile optimizations
-    const isMobileLow = this.isMobile && config.graphicsQuality === 'low';
     this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isMobile && config.graphicsQuality !== 'low',
-      powerPreference: this.isMobile ? 'default' : 'high-performance',
+      antialias: false, // Never antialias — biggest perf win
+      powerPreference: this.isMobile ? 'low-power' : 'high-performance',
+      stencil: false,
+      depth: true,
     });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
-    const maxPR = this.isMobile ? 1.5 : 2;
-    this.renderer.setPixelRatio(isMobileLow ? 1 : Math.min(window.devicePixelRatio, maxPR));
-    this.renderer.shadowMap.enabled = !isMobileLow;
+    this.renderer.setPixelRatio(this.isMobile ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.shadowMap.enabled = !this.isMobile && config.graphicsQuality === 'high';
     if (this.renderer.shadowMap.enabled) this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.0;
@@ -137,7 +146,6 @@ export class GameEngine {
 
     this.setupEnvironment();
     this.setupParticles();
-    if (!this.isMobile) this.setupFogPlanes();
     this.setupWorld();
     this.setupPlayer();
     this.setupAnimals();
@@ -146,23 +154,8 @@ export class GameEngine {
     window.addEventListener('resize', this.onWindowResize);
   }
 
-  private setupFogPlanes() {
-    if (this.config.graphicsQuality === 'low') return;
-    const fogMat = new THREE.MeshBasicMaterial({ color: 0x667766, transparent: true, opacity: 0.04, side: THREE.DoubleSide, depthWrite: false });
-    for (let i = 0; i < 6; i++) {
-      const plane = new THREE.Mesh(new THREE.PlaneGeometry(60, 15), fogMat);
-      plane.position.set((Math.random() - 0.5) * 80, 5 + Math.random() * 5, (Math.random() - 0.5) * 80);
-      plane.rotation.y = Math.random() * Math.PI;
-      plane.renderOrder = 999;
-      this.scene.add(plane);
-      this.fogPlanes.push(plane);
-    }
-  }
-
   private setupControls() {
     const canvas = this.renderer.domElement;
-
-    // Desktop controls
     canvas.addEventListener('click', () => {
       if (!this.isPointerLocked && !this.isMobile) canvas.requestPointerLock();
     });
@@ -174,7 +167,6 @@ export class GameEngine {
       this.cameraRotationAngle -= e.movementX * 0.003;
       this.cameraPitch = Math.max(-0.5, Math.min(0.8, this.cameraPitch + e.movementY * 0.002));
     });
-
     const keysDown = new Set<string>();
     document.addEventListener('keydown', (e: KeyboardEvent) => {
       keysDown.add(e.key.toLowerCase());
@@ -190,7 +182,7 @@ export class GameEngine {
       this.updateKeyboardMove(keysDown);
     });
 
-    // Mobile camera - improved: use right side of screen for camera, track specific touch
+    // Mobile camera touch
     canvas.addEventListener('touchstart', (e: TouchEvent) => {
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i];
@@ -202,23 +194,19 @@ export class GameEngine {
         }
       }
     }, { passive: true });
-
     canvas.addEventListener('touchmove', (e: TouchEvent) => {
       if (!this.touchLookActive || this.touchLookId === null) return;
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i];
         if (t.identifier === this.touchLookId) {
-          const dx = t.clientX - this.lastTouchX;
-          const dy = t.clientY - this.lastTouchY;
-          this.cameraRotationAngle -= dx * 0.004;
-          this.cameraPitch = Math.max(-0.5, Math.min(0.8, this.cameraPitch + dy * 0.002));
+          this.cameraRotationAngle -= (t.clientX - this.lastTouchX) * 0.004;
+          this.cameraPitch = Math.max(-0.5, Math.min(0.8, this.cameraPitch + (t.clientY - this.lastTouchY) * 0.002));
           this.lastTouchX = t.clientX;
           this.lastTouchY = t.clientY;
           break;
         }
       }
     }, { passive: true });
-
     canvas.addEventListener('touchend', (e: TouchEvent) => {
       for (let i = 0; i < e.changedTouches.length; i++) {
         if (e.changedTouches[i].identifier === this.touchLookId) {
@@ -243,42 +231,47 @@ export class GameEngine {
   private setupEnvironment() {
     this.hemiLight = new THREE.HemisphereLight(0x88ccff, 0x223311, 0.5);
     this.hemiLight.position.set(0, 100, 0); this.scene.add(this.hemiLight);
-    this.scene.add(new THREE.AmbientLight(0x334433, 0.2));
+    this.scene.add(new THREE.AmbientLight(0x334433, this.isMobile ? 0.4 : 0.2));
     this.dirLight = new THREE.DirectionalLight(0xfffaf0, 1.6);
     this.dirLight.position.set(60, 100, 60);
-    this.dirLight.castShadow = this.config.graphicsQuality !== 'low' && !this.isMobile;
+    this.dirLight.castShadow = !this.isMobile && this.config.graphicsQuality === 'high';
     if (this.dirLight.castShadow) {
       const s = this.dirLight.shadow;
-      s.camera.top = s.camera.right = 80; s.camera.bottom = s.camera.left = -80;
-      s.camera.near = 0.1; s.camera.far = 250;
-      const sz = this.config.graphicsQuality === 'high' ? 4096 : 2048;
-      s.mapSize.width = s.mapSize.height = sz;
+      s.camera.top = s.camera.right = 60; s.camera.bottom = s.camera.left = -60;
+      s.camera.near = 0.5; s.camera.far = 200;
+      s.mapSize.width = s.mapSize.height = 2048;
       s.bias = -0.0002; s.normalBias = 0.02;
     }
     this.scene.add(this.dirLight);
-    this.sunLight = new THREE.PointLight(0xffeecc, 0.5, 300);
-    this.sunLight.position.copy(this.dirLight.position); this.scene.add(this.sunLight);
-    this.scene.add(new THREE.DirectionalLight(0xaaddff, 0.25).translateOnAxis(new THREE.Vector3(-40, 60, -40), 1));
-    const skyGeo = new THREE.SphereGeometry(200, 32, 16);
+    if (!this.isMobile) {
+      this.sunLight = new THREE.PointLight(0xffeecc, 0.5, 300);
+      this.sunLight.position.copy(this.dirLight.position); this.scene.add(this.sunLight);
+      this.scene.add(new THREE.DirectionalLight(0xaaddff, 0.25).translateOnAxis(new THREE.Vector3(-40, 60, -40), 1));
+    } else {
+      this.sunLight = new THREE.PointLight(0xffeecc, 0, 0); // dummy
+    }
+    const skySegs = this.isMobile ? 16 : 32;
+    const skyGeo = new THREE.SphereGeometry(200, skySegs, skySegs / 2);
     this.skyMaterial = createSkyMaterial();
     this.skyMesh = new THREE.Mesh(skyGeo, this.skyMaterial);
     this.scene.add(this.skyMesh);
   }
 
   private setupParticles() {
-    const isLow = this.isMobile || this.config.graphicsQuality === 'low';
-    const rc = isLow ? 600 : (this.config.graphicsQuality === 'high' ? 3000 : 1200);
+    // Rain — reduced on mobile
+    const rc = this.isMobile ? 200 : (this.config.graphicsQuality === 'high' ? 3000 : 1200);
     const rg = new THREE.BufferGeometry();
     const rp = new Float32Array(rc * 3);
     for (let i = 0; i < rc * 3; i += 3) {
-      rp[i] = (Math.random() - 0.5) * 80; rp[i + 1] = Math.random() * 30;
-      rp[i + 2] = (Math.random() - 0.5) * 80;
+      rp[i] = (Math.random() - 0.5) * 60; rp[i + 1] = Math.random() * 25;
+      rp[i + 2] = (Math.random() - 0.5) * 60;
     }
     rg.setAttribute('position', new THREE.BufferAttribute(rp, 3));
-    const rm = new THREE.PointsMaterial({ color: 0xccddee, size: 0.08, transparent: true, opacity: 0.5 });
-    this.rainParticles = new THREE.Points(rg, rm); this.scene.add(this.rainParticles);
+    this.rainParticles = new THREE.Points(rg, new THREE.PointsMaterial({ color: 0xccddee, size: 0.08, transparent: true, opacity: 0.5 }));
+    this.scene.add(this.rainParticles);
 
-    const fc = isLow ? 30 : 80;
+    // Fireflies — very few on mobile
+    const fc = this.isMobile ? 12 : 80;
     const fg = new THREE.BufferGeometry();
     const fp = new Float32Array(fc * 3); const fo = new Float32Array(fc);
     for (let i = 0; i < fc; i++) {
@@ -290,37 +283,44 @@ export class GameEngine {
     this.fireflyMaterial = createFireflyMaterial();
     this.fireflyParticles = new THREE.Points(fg, this.fireflyMaterial); this.scene.add(this.fireflyParticles);
 
-    const lc = isLow ? 40 : 100;
-    const lg = new THREE.BufferGeometry();
-    const lp = new Float32Array(lc * 3);
-    for (let i = 0; i < lc * 3; i += 3) {
-      lp[i] = (Math.random() - 0.5) * 60; lp[i + 1] = 3 + Math.random() * 8;
-      lp[i + 2] = (Math.random() - 0.5) * 60;
-    }
-    lg.setAttribute('position', new THREE.BufferAttribute(lp, 3));
-    const lm = new THREE.PointsMaterial({ color: 0x44aa33, size: 0.15, transparent: true, opacity: 0.4 });
-    this.leafParticles = new THREE.Points(lg, lm); this.scene.add(this.leafParticles);
+    // Leaf + dust — skip entirely on mobile
+    if (!this.isMobile) {
+      const lc = 100;
+      const lg = new THREE.BufferGeometry();
+      const lp = new Float32Array(lc * 3);
+      for (let i = 0; i < lc * 3; i += 3) {
+        lp[i] = (Math.random() - 0.5) * 60; lp[i + 1] = 3 + Math.random() * 8;
+        lp[i + 2] = (Math.random() - 0.5) * 60;
+      }
+      lg.setAttribute('position', new THREE.BufferAttribute(lp, 3));
+      this.leafParticles = new THREE.Points(lg, new THREE.PointsMaterial({ color: 0x44aa33, size: 0.15, transparent: true, opacity: 0.4 }));
+      this.scene.add(this.leafParticles);
 
-    const dc = isLow ? 20 : 60;
-    const dg = new THREE.BufferGeometry();
-    const dp = new Float32Array(dc * 3); const dof = new Float32Array(dc);
-    for (let i = 0; i < dc; i++) {
-      dp[i * 3] = (Math.random() - 0.5) * 50; dp[i * 3 + 1] = Math.random() * 4;
-      dp[i * 3 + 2] = (Math.random() - 0.5) * 50; dof[i] = Math.random();
+      const dc = 60;
+      const dg = new THREE.BufferGeometry();
+      const dp = new Float32Array(dc * 3); const dof = new Float32Array(dc);
+      for (let i = 0; i < dc; i++) {
+        dp[i * 3] = (Math.random() - 0.5) * 50; dp[i * 3 + 1] = Math.random() * 4;
+        dp[i * 3 + 2] = (Math.random() - 0.5) * 50; dof[i] = Math.random();
+      }
+      dg.setAttribute('position', new THREE.BufferAttribute(dp, 3));
+      dg.setAttribute('aOffset', new THREE.BufferAttribute(dof, 1));
+      this.dustMaterial = createDustMaterial();
+      this.dustParticles = new THREE.Points(dg, this.dustMaterial); this.scene.add(this.dustParticles);
+    } else {
+      this.leafParticles = null;
+      this.dustParticles = null;
+      this.dustMaterial = null;
     }
-    dg.setAttribute('position', new THREE.BufferAttribute(dp, 3));
-    dg.setAttribute('aOffset', new THREE.BufferAttribute(dof, 1));
-    this.dustMaterial = createDustMaterial();
-    this.dustParticles = new THREE.Points(dg, this.dustMaterial); this.scene.add(this.dustParticles);
   }
 
   private setupWorld() {
-    const gen = new WorldGenerator(this.worldSeed);
+    const gen = new WorldGenerator(this.worldSeed, this.isMobile);
     this.ground = gen.generate();
     this.scene.add(this.ground.terrainMesh);
     this.scene.add(this.ground.waterMesh);
     this.waterMaterial = this.ground.waterMesh.material as THREE.ShaderMaterial;
-    this.scene.add(this.ground.grassGroup);
+    if (!this.isMobile) this.scene.add(this.ground.grassGroup);
     this.ground.items.forEach(item => this.scene.add(item.mesh));
   }
 
@@ -334,8 +334,10 @@ export class GameEngine {
   }
 
   private setupAnimals() {
+    const m = this.isMobile ? 0.4 : 1;
     const spawn = (type: string, count: number, createFn: () => AnimalRig, hp: number, range: number) => {
-      for (let i = 0; i < count; i++) {
+      const n = Math.max(1, Math.floor(count * m));
+      for (let i = 0; i < n; i++) {
         const ax = (Math.random() - 0.5) * range;
         const az = (Math.random() - 0.5) * range;
         const ay = this.ground.getHeightAt(ax, az);
@@ -365,7 +367,7 @@ export class GameEngine {
         const item = this.ground.items.find(i => i.id === id);
         if (item && item.health > 0) {
           this.scene.remove(item.mesh); item.health = 0;
-          this.particles.spawnBlockBreak(item.position.clone().add(new THREE.Vector3(0, 1, 0)), 0x5c4033);
+          if (!this.isMobile) this.particles.spawnBlockBreak(item.position.clone().add(new THREE.Vector3(0, 1, 0)), 0x5c4033);
           sounds.playBlockBreak();
         }
       },
@@ -373,7 +375,7 @@ export class GameEngine {
         const item = this.ground.items.find(i => i.id === id);
         if (item && item.health > 0) {
           this.scene.remove(item.mesh); item.health = 0;
-          this.particles.spawnBlockBreak(item.position.clone().add(new THREE.Vector3(0, 0.5, 0)), 0x737577);
+          if (!this.isMobile) this.particles.spawnBlockBreak(item.position.clone().add(new THREE.Vector3(0, 0.5, 0)), 0x737577);
           sounds.playBlockBreak();
         }
       },
@@ -396,6 +398,29 @@ export class GameEngine {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
   };
+
+  public loadInventory(inv: InventoryState) {
+    this.inventory = { ...inv };
+    this.onUpdateHUD();
+  }
+
+  public loadPlayerState(state: { x: number; y: number; z: number; health: number; hunger: number; stamina: number; timeOfDay: number }) {
+    this.playerPos.set(state.x, state.y, state.z);
+    this.playerRig.group.position.copy(this.playerPos);
+    this.health = state.health;
+    this.hunger = state.hunger;
+    this.stamina = state.stamina;
+    this.timeOfDay = state.timeOfDay;
+    this.onUpdateHUD();
+  }
+
+  public getPlayerState() {
+    return {
+      x: this.playerPos.x, y: this.playerPos.y, z: this.playerPos.z,
+      health: this.health, hunger: this.hunger, stamina: this.stamina,
+      timeOfDay: this.timeOfDay, inventory: { ...this.inventory }
+    };
+  }
 
   public start() {
     if (this.isRunning) return;
@@ -433,7 +458,7 @@ export class GameEngine {
       this.health = Math.min(100, this.health + 30);
       this.hunger = Math.min(100, this.hunger + 40);
       sounds.playSizzle();
-      this.particles.spawnSparkle(this.playerPos.clone().add(new THREE.Vector3(0, 1, 0)), 0x44ff88);
+      if (!this.isMobile) this.particles.spawnSparkle(this.playerPos.clone().add(new THREE.Vector3(0, 1, 0)), 0x44ff88);
       this.onAlert("🍖 Delicious! +30 HP, +40 Hunger");
       if (this.inventory.cookedMeat === 0) this.equipTool('none');
       this.onUpdateHUD(); return;
@@ -443,7 +468,6 @@ export class GameEngine {
     setTimeout(() => { this.isAttacking = false; }, 300);
     const dist = 3.0;
 
-    // Dropped items
     for (let i = this.droppedItems.length - 1; i >= 0; i--) {
       const d = this.droppedItems[i];
       if (d.pos.distanceTo(this.playerPos) < dist) {
@@ -457,14 +481,12 @@ export class GameEngine {
       }
     }
 
-    // Enemies
     for (let i = this.enemies.length - 1; i >= 0; i--) {
       const e = this.enemies[i];
       if (e.pos.distanceTo(this.playerPos) < dist) {
         const dmg = this.activeTool === 'sword' ? 35 : 10;
-        e.health -= dmg;
-        sounds.playHit();
-        this.particles.spawnBlood(e.pos.clone().add(new THREE.Vector3(0, 1, 0)));
+        e.health -= dmg; sounds.playHit();
+        if (!this.isMobile) this.particles.spawnBlood(e.pos.clone().add(new THREE.Vector3(0, 1, 0)));
         if (e.health <= 0) {
           this.scene.remove(e.group);
           if (e.burningEffect) this.scene.remove(e.burningEffect);
@@ -478,14 +500,13 @@ export class GameEngine {
       }
     }
 
-    // Animals
     for (let i = this.animals.length - 1; i >= 0; i--) {
       const a = this.animals[i];
       if (a.pos.distanceTo(this.playerPos) < dist) {
         const dmg = this.activeTool === 'sword' ? 30 : 8;
         a.health -= dmg; a.state = 'flee';
         sounds.playHit();
-        this.particles.spawnBlood(a.pos.clone().add(new THREE.Vector3(0, 0.5, 0)));
+        if (!this.isMobile) this.particles.spawnBlood(a.pos.clone().add(new THREE.Vector3(0, 0.5, 0)));
         if (a.health <= 0) {
           this.scene.remove(a.rig.group);
           const drop = createMeatModel(false); drop.position.copy(a.pos); drop.position.y += 0.3;
@@ -498,7 +519,6 @@ export class GameEngine {
       }
     }
 
-    // World items
     for (const item of this.ground.items) {
       if (item.health <= 0) continue;
       if (item.position.distanceTo(this.playerPos) >= dist) continue;
@@ -522,7 +542,6 @@ export class GameEngine {
       if (item.type === 'carrot' || item.type === 'flower') {
         if (item.type === 'carrot') { this.inventory.carrot++; this.hunger = Math.min(100, this.hunger + 15); this.onAlert("🥕 Carrot!"); }
         else { this.hunger = Math.min(100, this.hunger + 5); this.onAlert("🌸 +5 hunger"); }
-        this.particles.spawnSparkle(item.position.clone(), 0x88ff44);
         this.scene.remove(item.mesh); item.health = 0; sounds.playPickup(); this.onUpdateHUD(); return;
       }
       if (item.type === 'mushroom') {
@@ -532,14 +551,11 @@ export class GameEngine {
       }
       if (item.type === 'berryBush') {
         this.inventory.berries += 3; this.hunger = Math.min(100, this.hunger + 20);
-        this.particles.spawnSparkle(item.position.clone(), 0xcc2244); sounds.playPickup();
-        this.onAlert("🫐 Berries x3! +20 hunger"); this.onUpdateHUD(); return;
+        sounds.playPickup(); this.onAlert("🫐 Berries x3! +20 hunger"); this.onUpdateHUD(); return;
       }
       if (item.type === 'crystal') {
         this.inventory.crystal++; this.scene.remove(item.mesh); item.health = 0;
-        sounds.playLevelUp();
-        this.particles.spawnSparkle(item.position.clone(), 0x66ccff);
-        this.onAlert("💎 Crystal found!"); this.onUpdateHUD(); return;
+        sounds.playLevelUp(); this.onAlert("💎 Crystal found!"); this.onUpdateHUD(); return;
       }
       if (item.type === 'lootChest') {
         const lootTypes = ['wood', 'stone', 'gold', 'crystal'];
@@ -550,23 +566,16 @@ export class GameEngine {
         else if (loot === 'gold') this.inventory.gold += amount;
         else if (loot === 'crystal') this.inventory.crystal += amount;
         sounds.playLevelUp();
-        this.particles.spawnSparkle(item.position.clone(), 0xffd700);
         this.scene.remove(item.mesh); item.health = 0;
         this.onAlert(`🎁 Loot chest! ${amount}x ${loot}!`); this.onUpdateHUD(); return;
       }
-      // Mining/Chopping
       let dmg = 15;
       if (item.type === 'tree') {
         dmg = this.activeTool === 'axe' ? 40 : 15; sounds.playChop();
-        this.particles.spawnWoodChips(item.position.clone().add(new THREE.Vector3(0, 1.5, 0)));
-        item.mesh.rotation.z += (Math.random() - 0.5) * 0.12;
-        setTimeout(() => { if (item.mesh) item.mesh.rotation.z = 0; }, 120);
+        if (!this.isMobile) this.particles.spawnWoodChips(item.position.clone().add(new THREE.Vector3(0, 1.5, 0)));
       } else if (item.type === 'rock') {
         dmg = this.activeTool === 'pickaxe' ? 45 : 10; sounds.playMine();
-        this.particles.spawnHitSparks(item.position.clone().add(new THREE.Vector3(0, 0.3, 0)));
-        const origScale = item.mesh.scale.x;
-        item.mesh.scale.setScalar(origScale * 0.9);
-        setTimeout(() => { if (item.mesh) item.mesh.scale.setScalar(origScale); }, 100);
+        if (!this.isMobile) this.particles.spawnHitSparks(item.position.clone().add(new THREE.Vector3(0, 0.3, 0)));
       }
       item.health -= dmg;
       if (item.health <= 0) {
@@ -574,7 +583,6 @@ export class GameEngine {
         if (item.type === 'tree') {
           const wc = 2 + Math.floor(Math.random() * 3);
           this.inventory.wood += wc;
-          this.particles.spawnBlockBreak(item.position.clone().add(new THREE.Vector3(0, 1, 0)), 0x5c4033);
           sounds.playBlockBreak();
           this.multiplayer.sendTreeBreak(item.id);
           const drop = createWoodLogModel(); drop.position.copy(item.position); drop.position.y += 0.3;
@@ -584,7 +592,6 @@ export class GameEngine {
         } else if (item.type === 'rock') {
           const sc = 1 + Math.floor(Math.random() * 3);
           this.inventory.stone += sc;
-          this.particles.spawnBlockBreak(item.position.clone().add(new THREE.Vector3(0, 0.5, 0)), 0x737577);
           sounds.playBlockBreak();
           this.multiplayer.sendRockBreak(item.id);
           const drop = createStoneModel(); drop.position.copy(item.position); drop.position.y += 0.3;
@@ -602,8 +609,8 @@ export class GameEngine {
     const inv = this.inventory;
     if (recipe === 'workbench' && inv.wood >= 4) {
       inv.wood -= 4; inv.workbench = true;
-      const fwd = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), this.cameraRotationAngle);
-      const p = this.playerPos.clone().addScaledVector(fwd, 2.5);
+      this._fwd.set(0, 0, -1).applyAxisAngle(this._yAxis, this.cameraRotationAngle);
+      const p = this.playerPos.clone().addScaledVector(this._fwd, 2.5);
       p.y = this.ground.getHeightAt(p.x, p.z);
       const wb = createWorkbenchModel(); wb.position.copy(p); this.scene.add(wb);
       this.ground.items.push({ id: `wb_${Date.now()}`, type: 'workbench', mesh: wb, position: p, health: 200, maxHealth: 200, isCustomPlaced: true });
@@ -623,8 +630,8 @@ export class GameEngine {
   }
 
   public placeStructure(type: 'campfire' | 'furnace') {
-    const fwd = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), this.cameraRotationAngle);
-    const p = this.playerPos.clone().addScaledVector(fwd, 2.5);
+    this._fwd.set(0, 0, -1).applyAxisAngle(this._yAxis, this.cameraRotationAngle);
+    const p = this.playerPos.clone().addScaledVector(this._fwd, 2.5);
     p.y = this.ground.getHeightAt(p.x, p.z);
     if (type === 'campfire' && this.inventory.campfireCount > 0) {
       this.inventory.campfireCount--;
@@ -648,7 +655,6 @@ export class GameEngine {
     this.isNight = this.timeOfDay < 0.22 || this.timeOfDay > 0.78;
     if (this.isNight && !wasNight) { this.onAlert("🌙 Night falls. Beware!"); sounds.playZombieAlert(); this.spawnNightEnemies(); }
 
-    // Sync time to server in MP
     this.timeSyncTimer += delta;
     if (this.timeSyncTimer > 2 && this.multiplayer.connected) {
       this.multiplayer.sendTimeSync(this.timeOfDay);
@@ -658,41 +664,32 @@ export class GameEngine {
     const sunAngle = (this.timeOfDay - 0.25) * Math.PI * 2;
     const sunAlt = Math.sin(sunAngle);
     const sunX = Math.cos(sunAngle) * 100, sunY = Math.max(10, sunAlt * 100), sunZ = Math.sin(sunAngle) * 100;
-    const sunDir = new THREE.Vector3(sunX, sunY, sunZ).normalize();
     this.dirLight.position.set(sunX, sunY, sunZ);
-    this.sunLight.position.copy(this.dirLight.position);
+    if (!this.isMobile) this.sunLight.position.copy(this.dirLight.position);
 
     if (!this.isNight) {
       const w = Math.max(0, sunAlt);
-      if (this.timeOfDay > 0.65 && this.timeOfDay < 0.78) {
-        this.dirLight.color.setRGB(1.0, 0.6 + w * 0.2, 0.3 + w * 0.3);
-        this.dirLight.intensity = 0.8 + w * 0.8;
-      } else if (this.timeOfDay > 0.22 && this.timeOfDay < 0.35) {
-        this.dirLight.color.setRGB(1.0, 0.7 + w * 0.2, 0.5 + w * 0.3);
-        this.dirLight.intensity = 0.5 + w * 1.0;
-      } else {
-        this.dirLight.color.setRGB(1.0, 0.98, 0.94);
-        this.dirLight.intensity = 1.2 + w * 0.4;
-      }
+      this.dirLight.color.setRGB(1.0, 0.98, 0.94);
+      this.dirLight.intensity = 1.2 + w * 0.4;
       this.fog.color.setRGB(0.15 + w * 0.35, 0.2 + w * 0.35, 0.15 + w * 0.25);
     } else {
-      // Brighter night
       this.dirLight.color.setRGB(0.2, 0.25, 0.4);
       this.dirLight.intensity = 0.25;
       this.fog.color.setRGB(0.04, 0.06, 0.12);
     }
 
+    this._tmpV.set(sunX, sunY, sunZ).normalize();
     this.skyMaterial.uniforms.uTimeOfDay.value = this.timeOfDay;
-    this.skyMaterial.uniforms.uSunDir.value.copy(sunDir);
+    this.skyMaterial.uniforms.uSunDir.value.copy(this._tmpV);
     this.waterMaterial.uniforms.uTime.value = this.animationTime;
-    this.waterMaterial.uniforms.uSunDir.value.copy(sunDir);
+    this.waterMaterial.uniforms.uSunDir.value.copy(this._tmpV);
     this.waterMaterial.uniforms.uIsNight.value = this.isNight ? 1.0 : 0.0;
     this.waterMaterial.uniforms.uRainIntensity.value = this.config.rainIntensity;
     this.fireflyMaterial.uniforms.uTime.value = this.animationTime;
     this.fireflyMaterial.uniforms.uIsNight.value = this.isNight ? 1.0 : 0.0;
-    this.dustMaterial.uniforms.uTime.value = this.animationTime;
+    if (this.dustMaterial) this.dustMaterial.uniforms.uTime.value = this.animationTime;
 
-    // Rain
+    // Rain — only update if visible
     if (this.config.rainIntensity > 0.05) {
       const pa = (this.rainParticles.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
       const spd = 28 * delta * (0.5 + this.config.rainIntensity * 2);
@@ -704,56 +701,56 @@ export class GameEngine {
     }
     (this.rainParticles.material as THREE.PointsMaterial).opacity = this.config.rainIntensity > 0.05 ? 0.3 + this.config.rainIntensity * 0.5 : 0;
 
-    // Leaf particles
-    const la = (this.leafParticles.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
-    for (let i = 0; i < la.length; i += 3) {
-      la[i] += Math.sin(this.animationTime * 0.5 + i) * 0.02;
-      la[i + 1] -= delta * 0.5;
-      if (la[i + 1] < 0) la[i + 1] = 8 + Math.random() * 4;
+    // Leaf particles — desktop only
+    if (this.leafParticles) {
+      const la = (this.leafParticles.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
+      for (let i = 0; i < la.length; i += 3) {
+        la[i] += Math.sin(this.animationTime * 0.5 + i) * 0.02;
+        la[i + 1] -= delta * 0.5;
+        if (la[i + 1] < 0) la[i + 1] = 8 + Math.random() * 4;
+      }
+      this.leafParticles.geometry.attributes.position.needsUpdate = true;
     }
-    this.leafParticles.geometry.attributes.position.needsUpdate = true;
-
-    // Fog planes
-    this.fogPlanes.forEach((plane, i) => {
-      plane.position.x += Math.sin(this.animationTime * 0.1 + i) * 0.02;
-      plane.position.z += Math.cos(this.animationTime * 0.08 + i * 0.5) * 0.015;
-      (plane.material as THREE.MeshBasicMaterial).opacity = this.isNight ? 0.06 : 0.03;
-    });
 
     // Center particles around player
-    [this.rainParticles, this.fireflyParticles, this.leafParticles, this.dustParticles].forEach(p => {
-      p.position.set(this.playerPos.x, 0, this.playerPos.z);
-    });
+    this.rainParticles.position.set(this.playerPos.x, 0, this.playerPos.z);
+    this.fireflyParticles.position.set(this.playerPos.x, 0, this.playerPos.z);
+    if (this.leafParticles) this.leafParticles.position.set(this.playerPos.x, 0, this.playerPos.z);
+    if (this.dustParticles) this.dustParticles.position.set(this.playerPos.x, 0, this.playerPos.z);
 
     if (this.dirLight.shadow) {
       this.dirLight.target.position.copy(this.playerPos);
       this.dirLight.target.updateMatrixWorld();
     }
 
-    const nearFire = this.ground.items.some(it => (it.type === 'campfire' || it.type === 'furnace') && it.position.distanceTo(this.playerPos) < 6);
-    sounds.updateEnvironment(this.config.rainIntensity, this.isNight, nearFire);
+    // Only check fire proximity every 30 frames
+    if (this.frameCount % 30 === 0) {
+      const nearFire = this.ground.items.some(it =>
+        it.health > 0 && (it.type === 'campfire' || it.type === 'furnace') && it.position.distanceTo(this.playerPos) < 6);
+      sounds.updateEnvironment(this.config.rainIntensity, this.isNight, nearFire);
+    }
 
-    // Campfire animations
-    this.ground.items.forEach(item => {
-      if (item.type !== 'campfire') return;
-      item.mesh.traverse((obj: THREE.Object3D) => {
-        if (obj.name === "CampfireFlame") {
-          obj.scale.y = 0.8 + Math.sin(this.animationTime * 12) * 0.25;
-          obj.scale.x = 0.9 + Math.cos(this.animationTime * 10) * 0.15;
-          obj.rotation.y = this.animationTime * 2;
-        }
-        if (obj.name === "CampfireLight") (obj as THREE.PointLight).intensity = 2.5 + Math.sin(this.animationTime * 18) * 0.6;
-        if (obj.name.startsWith('ember_')) {
-          const idx = parseFloat(obj.name.split('_')[1]);
-          obj.position.y = 0.3 + Math.sin(this.animationTime * 6 + idx) * 0.15 + idx * 0.05;
-        }
-      });
-    });
+    // Campfire animations — only nearby, skip on mobile every other frame
+    if (!this.isMobile || this.frameCount % 2 === 0) {
+      for (let j = 0; j < this.ground.items.length; j++) {
+        const item = this.ground.items[j];
+        if (item.type !== 'campfire' || item.health <= 0) continue;
+        if (item.position.distanceTo(this.playerPos) > 30) continue;
+        item.mesh.traverse((obj: THREE.Object3D) => {
+          if (obj.name === "CampfireFlame") {
+            obj.scale.y = 0.8 + Math.sin(this.animationTime * 12) * 0.25;
+            obj.scale.x = 0.9 + Math.cos(this.animationTime * 10) * 0.15;
+            obj.rotation.y = this.animationTime * 2;
+          }
+          if (obj.name === "CampfireLight") (obj as THREE.PointLight).intensity = 2.5 + Math.sin(this.animationTime * 18) * 0.6;
+        });
+      }
+    }
   }
 
   private spawnNightEnemies() {
     if (this.config.difficulty === 'peaceful') return;
-    const count = this.config.difficulty === 'hard' ? 8 : 5;
+    const count = this.config.difficulty === 'hard' ? (this.isMobile ? 4 : 8) : (this.isMobile ? 2 : 5);
     const types = ['zombie', 'zombie', 'spider', 'skeleton', 'zombie', 'spider', 'skeleton', 'zombie'];
     for (let i = 0; i < count; i++) {
       const angle = Math.random() * Math.PI * 2;
@@ -783,18 +780,21 @@ export class GameEngine {
   private animate = () => {
     if (!this.isRunning) return;
     requestAnimationFrame(this.animate);
+    this.frameCount++;
     const delta = Math.min(this.clock.getDelta(), 0.1);
     this.animationTime += delta;
-    this.updateAtmosphere(delta);
-    this.particles.update(delta);
 
-    // MP sync
+    this.updateAtmosphere(delta);
+    if (!this.isMobile || this.frameCount % 2 === 0) this.particles.update(delta);
+
+    // MP sync — throttle more on mobile
     this.mpSyncTimer += delta;
-    if (this.mpSyncTimer > 0.1 && this.multiplayer.connected) {
+    const syncRate = this.isMobile ? 0.2 : 0.1;
+    if (this.mpSyncTimer > syncRate && this.multiplayer.connected) {
       this.multiplayer.sendState(this.playerPos, this.playerRig.group.rotation.y, this.health, this.activeTool, this.isAttacking);
       this.mpSyncTimer = 0;
     }
-    this.multiplayer.update(delta, this.animationTime);
+    if (!this.isMobile || this.frameCount % 3 === 0) this.multiplayer.update(delta, this.animationTime);
 
     if (this.hurtFlashTimer > 0) this.hurtFlashTimer -= delta;
 
@@ -803,27 +803,27 @@ export class GameEngine {
       this.lookDelta *= 0.85;
     }
 
-    // Movement
-    const fwd = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), this.cameraRotationAngle);
-    const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), this.cameraRotationAngle);
-    const mv = new THREE.Vector3();
-    mv.addScaledVector(fwd, this.moveVector.y);
-    mv.addScaledVector(right, this.moveVector.x);
-    if (mv.lengthSq() > 0) {
-      mv.normalize();
+    // Movement — reuse vectors
+    this._fwd.set(0, 0, -1).applyAxisAngle(this._yAxis, this.cameraRotationAngle);
+    this._right.set(1, 0, 0).applyAxisAngle(this._yAxis, this.cameraRotationAngle);
+    this._mv.set(0, 0, 0);
+    this._mv.addScaledVector(this._fwd, this.moveVector.y);
+    this._mv.addScaledVector(this._right, this.moveVector.x);
+    if (this._mv.lengthSq() > 0) {
+      this._mv.normalize();
       const h = this.ground.getHeightAt(this.playerPos.x, this.playerPos.z);
       const swimming = h < -0.8;
       const spd = (swimming ? 3 : 6) * delta;
-      this.playerPos.addScaledVector(mv, spd);
+      this.playerPos.addScaledVector(this._mv, spd);
       const hs = this.ground.worldSize / 2 - 5;
       this.playerPos.x = Math.max(-hs, Math.min(hs, this.playerPos.x));
       this.playerPos.z = Math.max(-hs, Math.min(hs, this.playerPos.z));
-      const targetAngle = Math.atan2(mv.x, mv.z);
+      const targetAngle = Math.atan2(this._mv.x, this._mv.z);
       let ad = targetAngle - this.playerRig.group.rotation.y;
       while (ad < -Math.PI) ad += Math.PI * 2;
       while (ad > Math.PI) ad -= Math.PI * 2;
       this.playerRig.group.rotation.y += ad * 0.12;
-      if (Math.floor(this.animationTime * 12) % 5 === 0) sounds.playStep(swimming || this.config.rainIntensity > 0.3);
+      if (this.frameCount % 5 === 0) sounds.playStep(swimming || this.config.rainIntensity > 0.3);
     }
 
     const ty = this.ground.getHeightAt(this.playerPos.x, this.playerPos.z);
@@ -843,135 +843,125 @@ export class GameEngine {
       this.playerRig.leftLeg.rotation.x = -c * 0.8;
       this.playerRig.rightLeg.rotation.x = c * 0.8;
       this.playerRig.group.position.y += Math.abs(Math.sin(this.animationTime * 28)) * 0.06;
-      this.playerRig.head.rotation.z = Math.sin(this.animationTime * 14) * 0.03;
     } else {
       this.playerRig.leftArm.rotation.x = Math.sin(this.animationTime * 2) * 0.04;
       this.playerRig.rightArm.rotation.x = -Math.sin(this.animationTime * 2) * 0.04;
       this.playerRig.leftLeg.rotation.x = 0;
       this.playerRig.rightLeg.rotation.x = 0;
-      this.playerRig.head.position.y = 1.68 + Math.sin(this.animationTime * 2) * 0.015;
-      this.playerRig.head.rotation.z = 0;
     }
 
-    // Camera
-    const co = this.cameraOffset.clone();
-    co.y += this.cameraPitch * 2;
-    co.z += this.cameraPitch * 1;
-    const cor = co.applyAxisAngle(new THREE.Vector3(0, 1, 0), this.cameraRotationAngle);
-    const tcp = this.playerPos.clone().add(cor);
-    this.camera.position.lerp(tcp, 0.08);
-    this.camera.lookAt(this.playerPos.clone().add(new THREE.Vector3(0, 1.5 - this.cameraPitch, 0)));
+    // Camera — reuse vectors
+    const co = this.cameraOffset;
+    this._tmpV.set(co.x, co.y + this.cameraPitch * 2, co.z + this.cameraPitch * 1);
+    this._tmpV.applyAxisAngle(this._yAxis, this.cameraRotationAngle);
+    this._tmpV.add(this.playerPos);
+    this.camera.position.lerp(this._tmpV, 0.08);
+    this._tmpV.set(this.playerPos.x, this.playerPos.y + 1.5 - this.cameraPitch, this.playerPos.z);
+    this.camera.lookAt(this._tmpV);
 
-    // Dropped items
-    this.droppedItems.forEach(item => {
-      item.mesh.position.y = item.pos.y + 0.2 + Math.sin(this.animationTime * 3 + item.bobOffset) * 0.1;
-      item.mesh.rotation.y += delta * 1.5;
-    });
-
-    // Enemies
-    for (let i = this.enemies.length - 1; i >= 0; i--) {
-      const e = this.enemies[i];
-      const dp = e.pos.distanceTo(this.playerPos);
-      if (!this.isNight && !e.isBurning) {
-        e.isBurning = true; e.burningEffect = createBurningEffect();
-        e.burningEffect.position.copy(e.pos); this.scene.add(e.burningEffect);
+    // Dropped items — only update every 2 frames on mobile
+    if (!this.isMobile || this.frameCount % 2 === 0) {
+      for (let i = 0; i < this.droppedItems.length; i++) {
+        const item = this.droppedItems[i];
+        item.mesh.position.y = item.pos.y + 0.2 + Math.sin(this.animationTime * 3 + item.bobOffset) * 0.1;
+        item.mesh.rotation.y += delta * 1.5;
       }
-      if (e.isBurning) {
-        e.burnTimer += delta; e.health -= delta * 15;
-        if (e.burningEffect) {
-          e.burningEffect.position.copy(e.pos);
-          e.burningEffect.traverse((obj: THREE.Object3D) => {
-            if (obj.name.startsWith('flame_')) obj.scale.y = 0.8 + Math.sin(this.animationTime * 20 + parseFloat(obj.name.split('_')[1])) * 0.3;
-            if (obj.name === 'fireCore') obj.scale.setScalar(0.8 + Math.sin(this.animationTime * 25) * 0.2);
-          });
-        }
-        if (e.health <= 0 || e.burnTimer > 5) {
+    }
+
+    // Enemies — skip distant processing, throttle on mobile
+    if (!this.isMobile || this.frameCount % 2 === 0) {
+      for (let i = this.enemies.length - 1; i >= 0; i--) {
+        const e = this.enemies[i];
+        const dp = e.pos.distanceTo(this.playerPos);
+        if (dp > 60) {
           this.scene.remove(e.group); if (e.burningEffect) this.scene.remove(e.burningEffect);
           this.enemies.splice(i, 1); continue;
         }
-      }
-      e.growlTimer -= delta;
-      if (e.growlTimer <= 0) { sounds.playZombieGrowl(); e.growlTimer = 3 + Math.random() * 5; }
-      e.attackCooldown -= delta;
-      if (dp < 1.5 && e.attackCooldown <= 0 && !e.isBurning) {
-        const eDmg = this.config.difficulty === 'hard' ? 20 : 10;
-        this.health -= eDmg; this.hurtFlashTimer = 0.3;
-        sounds.playHit(); e.attackCooldown = 1.5;
-        this.onAlert("💥 Hit! -" + eDmg + " HP"); this.onUpdateHUD();
-        if (this.health <= 0) { this.onAlert("💀 You have fallen..."); this.isRunning = false; this.onUpdateHUD(); }
-      }
-      if (dp < 25 && !e.isBurning && dp > 1.0) {
-        const dir = this.playerPos.clone().sub(e.pos).normalize();
-        e.pos.addScaledVector(dir, e.speed * delta);
-        e.pos.y = this.ground.getHeightAt(e.pos.x, e.pos.z);
-        e.group.position.copy(e.pos);
-        e.group.lookAt(this.playerPos);
-        if (e.rig) {
-          const cycle = Math.sin(this.animationTime * 8);
-          e.rig.leftLeg.rotation.x = cycle * 0.6;
-          e.rig.rightLeg.rotation.x = -cycle * 0.6;
-          e.rig.leftArm.rotation.x = -0.8 + cycle * 0.2;
-          e.rig.rightArm.rotation.x = -0.8 - cycle * 0.2;
+        if (!this.isNight && !e.isBurning) {
+          e.isBurning = true; e.burningEffect = createBurningEffect();
+          e.burningEffect.position.copy(e.pos); this.scene.add(e.burningEffect);
         }
-        if (e.rigType === 'spider') {
-          e.group.traverse((child: THREE.Object3D) => {
-            if (child.name.startsWith('spider_leg_')) {
-              child.rotation.z += Math.sin(this.animationTime * 25 + parseInt(child.name.replace('spider_leg_', ''))) * 0.04;
-            }
-          });
+        if (e.isBurning) {
+          e.burnTimer += delta; e.health -= delta * 15;
+          if (e.burningEffect) e.burningEffect.position.copy(e.pos);
+          if (e.health <= 0 || e.burnTimer > 5) {
+            this.scene.remove(e.group); if (e.burningEffect) this.scene.remove(e.burningEffect);
+            this.enemies.splice(i, 1); continue;
+          }
         }
-      } else if (dp > 60) {
-        this.scene.remove(e.group); if (e.burningEffect) this.scene.remove(e.burningEffect);
-        this.enemies.splice(i, 1);
+        e.growlTimer -= delta;
+        if (e.growlTimer <= 0) { sounds.playZombieGrowl(); e.growlTimer = 3 + Math.random() * 5; }
+        e.attackCooldown -= delta;
+        if (dp < 1.5 && e.attackCooldown <= 0 && !e.isBurning) {
+          const eDmg = this.config.difficulty === 'hard' ? 20 : 10;
+          this.health -= eDmg; this.hurtFlashTimer = 0.3;
+          sounds.playHit(); e.attackCooldown = 1.5;
+          this.onAlert("💥 Hit! -" + eDmg + " HP"); this.onUpdateHUD();
+          if (this.health <= 0) { this.onAlert("💀 You have fallen..."); this.isRunning = false; this.onUpdateHUD(); }
+        }
+        if (dp < 25 && !e.isBurning && dp > 1.0) {
+          this._dir.copy(this.playerPos).sub(e.pos).normalize();
+          e.pos.addScaledVector(this._dir, e.speed * delta);
+          e.pos.y = this.ground.getHeightAt(e.pos.x, e.pos.z);
+          e.group.position.copy(e.pos);
+          e.group.lookAt(this.playerPos);
+          if (e.rig) {
+            const cycle = Math.sin(this.animationTime * 8);
+            e.rig.leftLeg.rotation.x = cycle * 0.6;
+            e.rig.rightLeg.rotation.x = -cycle * 0.6;
+            e.rig.leftArm.rotation.x = -0.8 + cycle * 0.2;
+            e.rig.rightArm.rotation.x = -0.8 - cycle * 0.2;
+          }
+        }
       }
     }
 
-    // Animals
-    this.animals.forEach(a => {
-      a.timer -= delta;
-      const dp = a.pos.distanceTo(this.playerPos);
-      if (a.animalType === 'wolf' && dp < 15 && this.config.difficulty !== 'peaceful') {
-        a.state = 'chase';
-      }
-      if (a.state === 'chase') {
-        const dir = this.playerPos.clone().sub(a.pos).normalize();
-        a.pos.addScaledVector(dir, 4 * delta);
-        a.rig.group.rotation.y = Math.atan2(dir.x, dir.z);
-        if (dp < 1.5 && a.timer <= 0) {
-          this.health -= 8; a.timer = 1.5; sounds.playHit();
-          this.onAlert("🐺 Wolf attack! -8 HP"); this.onUpdateHUD();
+    // Animals — throttle on mobile
+    if (!this.isMobile || this.frameCount % 3 === 0) {
+      for (let i = 0; i < this.animals.length; i++) {
+        const a = this.animals[i];
+        a.timer -= delta * (this.isMobile ? 3 : 1); // compensate for skipped frames
+        const dp = a.pos.distanceTo(this.playerPos);
+        if (a.animalType === 'wolf' && dp < 15 && this.config.difficulty !== 'peaceful') a.state = 'chase';
+        if (a.state === 'chase') {
+          this._dir.copy(this.playerPos).sub(a.pos).normalize();
+          a.pos.addScaledVector(this._dir, 4 * delta * (this.isMobile ? 3 : 1));
+          a.rig.group.rotation.y = Math.atan2(this._dir.x, this._dir.z);
+          if (dp < 1.5 && a.timer <= 0) {
+            this.health -= 8; a.timer = 1.5; sounds.playHit();
+            this.onAlert("🐺 Wolf attack! -8 HP"); this.onUpdateHUD();
+          }
+          if (dp > 25) a.state = 'graze';
+        } else if (a.state === 'flee') {
+          this._dir.copy(a.pos).sub(this.playerPos).normalize();
+          const fs = a.animalType === 'rabbit' ? 10 : 6;
+          a.pos.addScaledVector(this._dir, fs * delta * (this.isMobile ? 3 : 1));
+          a.rig.group.rotation.y = Math.atan2(this._dir.x, this._dir.z);
+          if (dp > 30) a.state = 'graze';
+        } else {
+          if (a.timer <= 0) {
+            a.vel.set((Math.random() - 0.5) * 2, 0, (Math.random() - 0.5) * 2);
+            a.timer = 2 + Math.random() * 5;
+          }
+          if (a.vel.lengthSq() > 0) a.rig.group.rotation.y = Math.atan2(a.vel.x, a.vel.z);
+          a.pos.addScaledVector(a.vel, delta * (this.isMobile ? 3 : 1));
+          if (dp < 5 && a.animalType !== 'wolf') a.state = 'flee';
         }
-        if (dp > 25) a.state = 'graze';
-      } else if (a.state === 'flee') {
-        const fd = a.pos.clone().sub(this.playerPos).normalize();
-        const fs = a.animalType === 'rabbit' ? 10 : 6;
-        a.pos.addScaledVector(fd, fs * delta);
-        a.rig.group.rotation.y = Math.atan2(fd.x, fd.z);
-        if (dp > 30) a.state = 'graze';
-      } else {
-        if (a.timer <= 0) {
-          a.vel.set((Math.random() - 0.5) * 2, 0, (Math.random() - 0.5) * 2);
-          a.timer = 2 + Math.random() * 5;
+        a.pos.y = this.ground.getHeightAt(a.pos.x, a.pos.z);
+        a.rig.group.position.copy(a.pos);
+        const isAnMoving = a.vel.lengthSq() > 0.1 || a.state !== 'graze';
+        if (isAnMoving) {
+          const c = Math.sin(this.animationTime * 12);
+          a.rig.frontLeftLeg.rotation.x = c * 0.5;
+          a.rig.frontRightLeg.rotation.x = -c * 0.5;
+          a.rig.backLeftLeg.rotation.x = -c * 0.5;
+          a.rig.backRightLeg.rotation.x = c * 0.5;
+        } else {
+          a.rig.frontLeftLeg.rotation.x = 0; a.rig.frontRightLeg.rotation.x = 0;
+          a.rig.backLeftLeg.rotation.x = 0; a.rig.backRightLeg.rotation.x = 0;
         }
-        if (a.vel.lengthSq() > 0) a.rig.group.rotation.y = Math.atan2(a.vel.x, a.vel.z);
-        a.pos.addScaledVector(a.vel, delta);
-        if (dp < 5 && a.animalType !== 'wolf') a.state = 'flee';
       }
-      a.pos.y = this.ground.getHeightAt(a.pos.x, a.pos.z);
-      a.rig.group.position.copy(a.pos);
-      const isAnMoving = a.vel.lengthSq() > 0.1 || a.state !== 'graze';
-      if (isAnMoving) {
-        const c = Math.sin(this.animationTime * 12);
-        a.rig.frontLeftLeg.rotation.x = c * 0.5;
-        a.rig.frontRightLeg.rotation.x = -c * 0.5;
-        a.rig.backLeftLeg.rotation.x = -c * 0.5;
-        a.rig.backRightLeg.rotation.x = c * 0.5;
-      } else {
-        a.rig.frontLeftLeg.rotation.x = 0; a.rig.frontRightLeg.rotation.x = 0;
-        a.rig.backLeftLeg.rotation.x = 0; a.rig.backRightLeg.rotation.x = 0;
-        a.rig.head.rotation.x = Math.sin(this.animationTime * 0.5) * 0.1;
-      }
-    });
+    }
 
     this.renderer.render(this.scene, this.camera);
   };

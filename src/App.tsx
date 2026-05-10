@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { GameEngine, GameConfig } from './game/GameEngine';
 import { sounds } from './audio/SoundManager';
 import TitleScreen from './components/TitleScreen';
@@ -10,10 +10,12 @@ export default function App() {
   const [inLobby, setInLobby] = useState(true);
   const [gameMode, setGameMode] = useState<'singleplayer' | 'multiplayer'>('singleplayer');
 
+  const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
   const [config, setConfig] = useState<GameConfig>({
-    graphicsQuality: 'medium',
+    graphicsQuality: isMobile ? 'low' : 'medium',
     difficulty: 'normal',
-    rainIntensity: 0.4,
+    rainIntensity: isMobile ? 0.1 : 0.4,
     daySpeed: 1.0,
   });
 
@@ -29,7 +31,7 @@ export default function App() {
     workbench: false, furnaceCount: 0, campfireCount: 0,
   });
 
-  const handleUpdateHUD = () => {
+  const handleUpdateHUD = useCallback(() => {
     if (!engineRef.current) return;
     const eng = engineRef.current;
     setHealth(Math.round(eng.health));
@@ -38,17 +40,27 @@ export default function App() {
     setTimeOfDay(eng.timeOfDay);
     setIsNight(eng.isNight);
     setInventory({ ...eng.inventory });
-  };
 
-  const handleAlert = (msg: string) => {
+    // Auto-save session in multiplayer
+    if (eng.multiplayer.connected && eng.multiplayer.shouldSave) {
+      const state = eng.getPlayerState();
+      eng.multiplayer.saveSession({
+        x: state.x, y: state.y, z: state.z,
+        health: state.health, hunger: state.hunger, stamina: state.stamina,
+        timeOfDay: state.timeOfDay, inventory: state.inventory as unknown as Record<string, unknown>
+      });
+      eng.multiplayer.resetSaveTimer();
+    }
+  }, []);
+
+  const handleAlert = useCallback((msg: string) => {
     setAlertMsg(msg);
     setTimeout(() => { setAlertMsg(prev => (prev === msg ? "" : prev)); }, 4500);
-  };
+  }, []);
 
   useEffect(() => {
     if (!containerRef.current) return;
     if (!engineRef.current) {
-      // Use fixed seed (42) for consistent world across all devices
       engineRef.current = new GameEngine(
         containerRef.current, config, handleUpdateHUD, handleAlert, 42
       );
@@ -62,7 +74,7 @@ export default function App() {
     if (engineRef.current) engineRef.current.setConfigParameters(newCfg);
   };
 
-  const handleStartGame = (mode: 'singleplayer' | 'multiplayer', playerName: string) => {
+  const handleStartGame = async (mode: 'singleplayer' | 'multiplayer', playerName: string) => {
     sounds.init();
     setGameMode(mode);
     setInLobby(false);
@@ -70,7 +82,21 @@ export default function App() {
     if (engineRef.current) {
       if (mode === 'multiplayer') {
         engineRef.current.multiplayer.playerName = playerName;
-        engineRef.current.multiplayer.connect();
+        // Set up session loaded callback BEFORE connecting
+        engineRef.current.multiplayer.onSessionLoaded = (session) => {
+          if (engineRef.current) {
+            engineRef.current.loadPlayerState({
+              x: session.x, y: session.y, z: session.z,
+              health: session.health, hunger: session.hunger,
+              stamina: session.stamina, timeOfDay: session.timeOfDay
+            });
+            if (session.inventory) {
+              engineRef.current.loadInventory(session.inventory as any);
+            }
+            handleAlert("📦 Session restored! Welcome back, " + playerName + "!");
+          }
+        };
+        await engineRef.current.multiplayer.connect();
       }
       engineRef.current.start();
     }
@@ -78,10 +104,7 @@ export default function App() {
 
   return (
     <div className="w-screen h-screen overflow-hidden bg-black relative">
-      {/* 3D Canvas Container */}
       <div ref={containerRef} className="absolute inset-0" />
-
-      {/* UI Overlays */}
       {inLobby ? (
         <TitleScreen config={config} onUpdateConfig={handleUpdateConfig} onStart={handleStartGame} />
       ) : (

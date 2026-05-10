@@ -18,6 +18,14 @@ interface PlayerState {
   rot: number; tool: string; isAttacking: boolean; health: number; timestamp: number;
 }
 
+interface SavedSession {
+  x: number; y: number; z: number;
+  health: number; hunger: number; stamina: number;
+  timeOfDay: number;
+  inventory: Record<string, unknown>;
+  timestamp: number;
+}
+
 interface WorldEvent {
   type: 'treeBreak' | 'rockBreak' | 'placeStructure';
   itemId: string; structureType?: string;
@@ -27,6 +35,16 @@ interface WorldEvent {
 
 export interface ChatMessage {
   id: string; sender: string; text: string; timestamp: number;
+}
+
+// Deterministic hash from player name -> stable ID
+function nameToId(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = ((hash << 5) - hash) + name.charCodeAt(i);
+    hash |= 0;
+  }
+  return 'p_' + Math.abs(hash).toString(36);
 }
 
 export class MultiplayerManager {
@@ -41,14 +59,17 @@ export class MultiplayerManager {
   private onPlaceItem: ((type: string, pos: THREE.Vector3) => void) | null = null;
   public onChatMessage: ((msg: ChatMessage) => void) | null = null;
   public onTimeSync: ((time: number) => void) | null = null;
+  public onSessionLoaded: ((session: SavedSession) => void) | null = null;
   public connected = false;
   public peerCount = 0;
   public connectionError: string | null = null;
+  private firebaseApp: ReturnType<typeof initializeApp> | null = null;
+  private saveTimer = 0;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
-    this.myId = 'player_' + Math.random().toString(36).substr(2, 9);
-    this._myName = 'Survivor_' + Math.floor(Math.random() * 9999);
+    this._myName = 'Survivor';
+    this.myId = nameToId(this._myName);
   }
 
   public setCallbacks(opts: {
@@ -62,9 +83,33 @@ export class MultiplayerManager {
   }
 
   public async connect() {
+    if (this.connected) return;
     try {
-      const app = initializeApp(firebaseConfig, 'mistfall-mp-' + this.myId);
-      this.db = getDatabase(app);
+      // Use name-based stable ID so same name = same session
+      this.myId = nameToId(this._myName);
+
+      const appName = 'mistfall-mp-' + this.myId;
+      // Reuse existing app if already initialized
+      try {
+        this.firebaseApp = initializeApp(firebaseConfig, appName);
+      } catch {
+        // App already exists, get it
+        const { getApp } = await import('firebase/app');
+        this.firebaseApp = getApp(appName);
+      }
+      this.db = getDatabase(this.firebaseApp);
+
+      // Check for existing saved session for this player name
+      const sessionRef = ref(this.db, `sessions/${this.myId}`);
+      const sessionSnap = await get(sessionRef);
+      if (sessionSnap.exists()) {
+        const saved = sessionSnap.val() as SavedSession;
+        // Only restore if session is less than 24 hours old
+        if (Date.now() - saved.timestamp < 86400000) {
+          if (this.onSessionLoaded) this.onSessionLoaded(saved);
+        }
+      }
+
       const myRef = ref(this.db, `players/${this.myId}`);
       await set(myRef, {
         id: this.myId, name: this._myName,
@@ -72,6 +117,7 @@ export class MultiplayerManager {
         isAttacking: false, health: 100, timestamp: Date.now()
       });
       onDisconnect(myRef).remove();
+
       const playersRef = ref(this.db, 'players');
       onChildAdded(playersRef, (snapshot) => {
         const data = snapshot.val() as PlayerState;
@@ -97,7 +143,6 @@ export class MultiplayerManager {
         this.peerCount = count;
       });
 
-      // World events
       const eventsRef = ref(this.db, 'events');
       onChildAdded(eventsRef, (snapshot) => {
         const event = snapshot.val() as WorldEvent;
@@ -105,7 +150,6 @@ export class MultiplayerManager {
         if (event && Date.now() - event.timestamp > 5000) remove(snapshot.ref);
       });
 
-      // Sync broken items
       const brokenRef = ref(this.db, 'brokenItems');
       const brokenSnapshot = await get(brokenRef);
       if (brokenSnapshot.exists()) {
@@ -116,16 +160,13 @@ export class MultiplayerManager {
         });
       }
 
-      // Chat messages
       const chatRef = ref(this.db, 'chat');
       onChildAdded(chatRef, (snapshot) => {
         const msg = snapshot.val() as ChatMessage;
         if (msg && this.onChatMessage) this.onChatMessage(msg);
-        // Clean old messages
         if (msg && Date.now() - msg.timestamp > 60000) remove(snapshot.ref);
       });
 
-      // Day/night sync - host publishes, others read
       const timeRef = ref(this.db, 'worldTime');
       onValue(timeRef, (snapshot) => {
         const val = snapshot.val();
@@ -141,6 +182,13 @@ export class MultiplayerManager {
       this.connectionError = (error as Error).message;
       this.connected = false;
     }
+  }
+
+  // Save session to Firebase so rejoining with same name restores state
+  public saveSession(state: { x: number; y: number; z: number; health: number; hunger: number; stamina: number; timeOfDay: number; inventory: Record<string, unknown> }) {
+    if (!this.connected || !this.db) return;
+    const sessionRef = ref(this.db, `sessions/${this.myId}`);
+    set(sessionRef, { ...state, timestamp: Date.now() });
   }
 
   private handleWorldEvent(event: WorldEvent) {
@@ -165,7 +213,6 @@ export class MultiplayerManager {
     });
     rig.group.position.set(data.x, data.y, data.z);
     this.scene.add(rig.group);
-    // Name tag
     const canvas = document.createElement('canvas');
     canvas.width = 256; canvas.height = 64;
     const ctx = canvas.getContext('2d')!;
@@ -208,14 +255,12 @@ export class MultiplayerManager {
 
   public sendTimeSync(time: number) {
     if (!this.connected || !this.db) return;
-    const timeRef = ref(this.db, 'worldTime');
-    set(timeRef, { time, hostId: this.myId, timestamp: Date.now() });
+    set(ref(this.db, 'worldTime'), { time, hostId: this.myId, timestamp: Date.now() });
   }
 
   public sendChatMessage(text: string) {
     if (!this.connected || !this.db) return;
-    const chatRef = ref(this.db, 'chat');
-    push(chatRef, { id: this.myId, sender: this._myName, text, timestamp: Date.now() });
+    push(ref(this.db, 'chat'), { id: this.myId, sender: this._myName, text, timestamp: Date.now() });
   }
 
   public sendTreeBreak(itemId: string) {
@@ -239,7 +284,10 @@ export class MultiplayerManager {
     });
   }
 
-  public update(_delta: number, animTime: number) {
+  public update(delta: number, animTime: number) {
+    // Auto-save session every 10 seconds
+    this.saveTimer += delta;
+
     for (const [id, peer] of this.peers) {
       if (Date.now() - peer.lastUpdate > 15000) { this.removePeer(id); continue; }
       const s = peer.state;
@@ -269,6 +317,9 @@ export class MultiplayerManager {
     }
   }
 
+  public get shouldSave() { return this.saveTimer >= 10; }
+  public resetSaveTimer() { this.saveTimer = 0; }
+
   public disconnect() {
     if (!this.db) return;
     remove(ref(this.db, `players/${this.myId}`));
@@ -280,7 +331,7 @@ export class MultiplayerManager {
   }
 
   public get playerName() { return this._myName; }
-  public set playerName(n: string) { this._myName = n; }
+  public set playerName(n: string) { this._myName = n; this.myId = nameToId(n); }
   public get playerId() { return this.myId; }
   public get room() { return 'Mistfall World'; }
 }
