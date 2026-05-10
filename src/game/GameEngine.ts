@@ -143,6 +143,13 @@ export class GameEngine {
     this.multiplayer = new MultiplayerManager(this.scene);
     this.multiplayer.onChatMessage = (msg) => { if (this.onChatReceived) this.onChatReceived(msg); };
     this.multiplayer.onTimeSync = (time) => { this.timeOfDay = time; };
+    this.multiplayer.onPlayerHit = (_attackerId, dmg) => {
+      this.health -= dmg; this.hurtFlashTimer = 0.3;
+      sounds.playOuch(); sounds.playSwordClash();
+      this.onAlert("⚔️ A player attacked you! -" + dmg + " HP");
+      this.onUpdateHUD();
+      if (this.health <= 0) { this.onAlert("💀 Slain by another player..."); this.isRunning = false; this.onUpdateHUD(); }
+    };
 
     this.setupEnvironment();
     this.setupParticles();
@@ -355,10 +362,10 @@ export class GameEngine {
       }
     };
     spawn('deer', 8, createDeerModel, 40, 150);
-    spawn('rabbit', 12, createRabbitModel, 10, 140);
-    spawn('fox', 6, createFoxModel, 25, 130);
-    spawn('wolf', 4, createWolfModel, 60, 160);
-    spawn('boar', 5, createBoarModel, 50, 140);
+    spawn('rabbit', 10, createRabbitModel, 10, 140);
+    spawn('fox', 5, createFoxModel, 25, 130);
+    spawn('wolf', 3, createWolfModel, 60, 160);
+    spawn('boar', 4, createBoarModel, 50, 140);
   }
 
   private setupMultiplayerCallbacks() {
@@ -500,11 +507,16 @@ export class GameEngine {
       }
     }
 
+    // PvP — attack nearby players (stop if we hit someone)
+    if (this.multiplayer.connected && this.attackNearbyPlayers()) {
+      this.onUpdateHUD(); return;
+    }
+
     for (let i = this.animals.length - 1; i >= 0; i--) {
       const a = this.animals[i];
       if (a.pos.distanceTo(this.playerPos) < dist) {
         const dmg = this.activeTool === 'sword' ? 30 : 8;
-        a.health -= dmg; a.state = 'flee';
+        a.health -= dmg; a.state = 'flee'; a.timer = 0;
         sounds.playHit();
         if (!this.isMobile) this.particles.spawnBlood(a.pos.clone().add(new THREE.Vector3(0, 0.5, 0)));
         if (a.health <= 0) {
@@ -681,6 +693,7 @@ export class GameEngine {
     this._tmpV.set(sunX, sunY, sunZ).normalize();
     this.skyMaterial.uniforms.uTimeOfDay.value = this.timeOfDay;
     this.skyMaterial.uniforms.uSunDir.value.copy(this._tmpV);
+    if (this.skyMaterial.uniforms.uCloudTime) this.skyMaterial.uniforms.uCloudTime.value = this.animationTime * 0.02;
     this.waterMaterial.uniforms.uTime.value = this.animationTime;
     this.waterMaterial.uniforms.uSunDir.value.copy(this._tmpV);
     this.waterMaterial.uniforms.uIsNight.value = this.isNight ? 1.0 : 0.0;
@@ -777,6 +790,35 @@ export class GameEngine {
 
   public sendChat(text: string) { this.multiplayer.sendChatMessage(text); }
 
+  public attackNearbyPlayers(): boolean {
+    if (!this.multiplayer.connected) return false;
+    for (const [, peer] of this.multiplayer.peers) {
+      const peerPos = peer.rig.group.position;
+      if (peerPos.distanceTo(this.playerPos) < 3.0) {
+        const dmg = this.activeTool === 'sword' ? 20 : 5;
+        this.multiplayer.sendAttack(peer.state.id, dmg);
+        sounds.playSwordClash();
+        this.onAlert("⚔️ Attacked " + peer.state.name + "!");
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public applySkin(hat: number, body: number, pants: number) {
+    this.multiplayer.skinColors = { hat, body, pants };
+    // Apply to own player model
+    this.playerRig.group.traverse((child) => {
+      if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshLambertMaterial) {
+        const m = child.material as THREE.MeshLambertMaterial;
+        const hex = m.color.getHex();
+        if (hex === 0xd9534f) m.color.setHex(hat);
+        else if (hex === 0x3d5a40 || hex === 0x2d4030) m.color.setHex(body);
+        else if (hex === 0x2b2b2b) m.color.setHex(pants);
+      }
+    });
+  }
+
   private animate = () => {
     if (!this.isRunning) return;
     requestAnimationFrame(this.animate);
@@ -823,7 +865,7 @@ export class GameEngine {
       while (ad < -Math.PI) ad += Math.PI * 2;
       while (ad > Math.PI) ad -= Math.PI * 2;
       this.playerRig.group.rotation.y += ad * 0.12;
-      if (this.frameCount % 5 === 0) sounds.playStep(swimming || this.config.rainIntensity > 0.3);
+      if (this.frameCount % 8 === 0) sounds.playFootstep();
     }
 
     const ty = this.ground.getHeightAt(this.playerPos.x, this.playerPos.z);
@@ -895,7 +937,7 @@ export class GameEngine {
         if (dp < 1.5 && e.attackCooldown <= 0 && !e.isBurning) {
           const eDmg = this.config.difficulty === 'hard' ? 20 : 10;
           this.health -= eDmg; this.hurtFlashTimer = 0.3;
-          sounds.playHit(); e.attackCooldown = 1.5;
+          sounds.playHit(); sounds.playOuch(); sounds.playZombieRoar(); e.attackCooldown = 1.5;
           this.onAlert("💥 Hit! -" + eDmg + " HP"); this.onUpdateHUD();
           if (this.health <= 0) { this.onAlert("💀 You have fallen..."); this.isRunning = false; this.onUpdateHUD(); }
         }
@@ -920,32 +962,35 @@ export class GameEngine {
     if (!this.isMobile || this.frameCount % 3 === 0) {
       for (let i = 0; i < this.animals.length; i++) {
         const a = this.animals[i];
-        a.timer -= delta * (this.isMobile ? 3 : 1); // compensate for skipped frames
+        const dtM = delta * (this.isMobile ? 3 : 1);
+        a.timer -= dtM;
         const dp = a.pos.distanceTo(this.playerPos);
-        if (a.animalType === 'wolf' && dp < 15 && this.config.difficulty !== 'peaceful') a.state = 'chase';
+        // Wolves chase only at night or hard mode
+        if (a.animalType === 'wolf' && dp < 12 && this.config.difficulty === 'hard') a.state = 'chase';
         if (a.state === 'chase') {
           this._dir.copy(this.playerPos).sub(a.pos).normalize();
-          a.pos.addScaledVector(this._dir, 4 * delta * (this.isMobile ? 3 : 1));
+          a.pos.addScaledVector(this._dir, 3.5 * dtM); // slower than player (6)
           a.rig.group.rotation.y = Math.atan2(this._dir.x, this._dir.z);
           if (dp < 1.5 && a.timer <= 0) {
-            this.health -= 8; a.timer = 1.5; sounds.playHit();
+            this.health -= 8; a.timer = 2.0; sounds.playHit(); sounds.playOuch();
             this.onAlert("🐺 Wolf attack! -8 HP"); this.onUpdateHUD();
           }
           if (dp > 25) a.state = 'graze';
         } else if (a.state === 'flee') {
+          // Only flee when attacked — run slower than player
           this._dir.copy(a.pos).sub(this.playerPos).normalize();
-          const fs = a.animalType === 'rabbit' ? 10 : 6;
-          a.pos.addScaledVector(this._dir, fs * delta * (this.isMobile ? 3 : 1));
+          const fs = a.animalType === 'rabbit' ? 5 : 4; // slower than player speed (6)
+          a.pos.addScaledVector(this._dir, fs * dtM);
           a.rig.group.rotation.y = Math.atan2(this._dir.x, this._dir.z);
-          if (dp > 30) a.state = 'graze';
+          if (dp > 25) a.state = 'graze';
         } else {
+          // Graze — walk slowly, do NOT auto-flee from player proximity
           if (a.timer <= 0) {
-            a.vel.set((Math.random() - 0.5) * 2, 0, (Math.random() - 0.5) * 2);
-            a.timer = 2 + Math.random() * 5;
+            a.vel.set((Math.random() - 0.5) * 1.0, 0, (Math.random() - 0.5) * 1.0);
+            a.timer = 3 + Math.random() * 6;
           }
           if (a.vel.lengthSq() > 0) a.rig.group.rotation.y = Math.atan2(a.vel.x, a.vel.z);
-          a.pos.addScaledVector(a.vel, delta * (this.isMobile ? 3 : 1));
-          if (dp < 5 && a.animalType !== 'wolf') a.state = 'flee';
+          a.pos.addScaledVector(a.vel, dtM * 0.5);
         }
         a.pos.y = this.ground.getHeightAt(a.pos.x, a.pos.z);
         a.rig.group.position.copy(a.pos);

@@ -3,12 +3,14 @@ import { GameEngine, GameConfig } from './game/GameEngine';
 import { sounds } from './audio/SoundManager';
 import TitleScreen from './components/TitleScreen';
 import HUD from './components/HUD';
+import AdminPanel from './components/AdminPanel';
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<GameEngine | null>(null);
   const [inLobby, setInLobby] = useState(true);
   const [gameMode, setGameMode] = useState<'singleplayer' | 'multiplayer'>('singleplayer');
+  const [adminOpen, setAdminOpen] = useState(false);
 
   const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
@@ -41,7 +43,6 @@ export default function App() {
     setIsNight(eng.isNight);
     setInventory({ ...eng.inventory });
 
-    // Auto-save session in multiplayer
     if (eng.multiplayer.connected && eng.multiplayer.shouldSave) {
       const state = eng.getPlayerState();
       eng.multiplayer.saveSession({
@@ -57,6 +58,18 @@ export default function App() {
     setAlertMsg(msg);
     setTimeout(() => { setAlertMsg(prev => (prev === msg ? "" : prev)); }, 4500);
   }, []);
+
+  // Tab key listener for admin panel
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Tab' && !inLobby) {
+        e.preventDefault();
+        setAdminOpen(prev => !prev);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [inLobby]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -74,15 +87,16 @@ export default function App() {
     if (engineRef.current) engineRef.current.setConfigParameters(newCfg);
   };
 
-  const handleStartGame = async (mode: 'singleplayer' | 'multiplayer', playerName: string) => {
+  const handleStartGame = async (mode: 'singleplayer' | 'multiplayer', playerName: string, skin?: { hat: number; body: number; pants: number }) => {
     sounds.init();
     setGameMode(mode);
     setInLobby(false);
 
     if (engineRef.current) {
+      if (skin) engineRef.current.applySkin(skin.hat, skin.body, skin.pants);
+
       if (mode === 'multiplayer') {
         engineRef.current.multiplayer.playerName = playerName;
-        // Set up session loaded callback BEFORE connecting
         engineRef.current.multiplayer.onSessionLoaded = (session) => {
           if (engineRef.current) {
             engineRef.current.loadPlayerState({
@@ -108,16 +122,25 @@ export default function App() {
       {inLobby ? (
         <TitleScreen config={config} onUpdateConfig={handleUpdateConfig} onStart={handleStartGame} />
       ) : (
-        engineRef.current && (
-          <HUD
-            engine={engineRef.current}
-            health={health} hunger={hunger} stamina={stamina}
-            timeOfDay={timeOfDay} isNight={isNight}
-            inventory={inventory} alertMsg={alertMsg}
-            rainIntensity={config.rainIntensity}
-            isMultiplayer={gameMode === 'multiplayer'}
-          />
-        )
+        <>
+          {engineRef.current && (
+            <HUD
+              engine={engineRef.current}
+              health={health} hunger={hunger} stamina={stamina}
+              timeOfDay={timeOfDay} isNight={isNight}
+              inventory={inventory} alertMsg={alertMsg}
+              rainIntensity={config.rainIntensity}
+              isMultiplayer={gameMode === 'multiplayer'}
+            />
+          )}
+          {adminOpen && engineRef.current && (
+            <AdminPanel
+              engine={engineRef.current}
+              onClose={() => setAdminOpen(false)}
+              onAlert={handleAlert}
+            />
+          )}
+        </>
       )}
     </div>
   );

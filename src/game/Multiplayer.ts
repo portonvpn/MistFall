@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, set, onValue, onDisconnect, remove, push, onChildAdded, onChildRemoved, off, get } from 'firebase/database';
+import { getDatabase, ref, set, onValue, onDisconnect, remove, push, onChildAdded, off, get } from 'firebase/database';
 import { createPlayerModel, PlayerRig } from './ProceduralModels';
 
 const firebaseConfig = {
@@ -16,14 +16,15 @@ const firebaseConfig = {
 interface PlayerState {
   id: string; name: string; x: number; y: number; z: number;
   rot: number; tool: string; isAttacking: boolean; health: number; timestamp: number;
+  skinHat?: number; skinBody?: number; skinPants?: number;
 }
+
+export interface SkinColors { hat: number; body: number; pants: number; }
 
 interface SavedSession {
   x: number; y: number; z: number;
   health: number; hunger: number; stamina: number;
-  timeOfDay: number;
-  inventory: Record<string, unknown>;
-  timestamp: number;
+  timeOfDay: number; inventory: Record<string, unknown>; timestamp: number;
 }
 
 interface WorldEvent {
@@ -37,7 +38,6 @@ export interface ChatMessage {
   id: string; sender: string; text: string; timestamp: number;
 }
 
-// Deterministic hash from player name -> stable ID
 function nameToId(name: string): string {
   let hash = 0;
   for (let i = 0; i < name.length; i++) {
@@ -52,7 +52,8 @@ export class MultiplayerManager {
   private scene: THREE.Scene;
   private myId: string;
   private _myName: string;
-  private peers: Map<string, { state: PlayerState; rig: PlayerRig; lastUpdate: number }> = new Map();
+  // PUBLIC so GameEngine can access for PvP
+  public peers: Map<string, { state: PlayerState; rig: PlayerRig; lastUpdate: number }> = new Map();
   private nameSprites: Map<string, THREE.Sprite> = new Map();
   private onTreeBreak: ((id: string) => void) | null = null;
   private onRockBreak: ((id: string) => void) | null = null;
@@ -60,11 +61,14 @@ export class MultiplayerManager {
   public onChatMessage: ((msg: ChatMessage) => void) | null = null;
   public onTimeSync: ((time: number) => void) | null = null;
   public onSessionLoaded: ((session: SavedSession) => void) | null = null;
+  public onPlayerHit: ((attackerId: string, dmg: number) => void) | null = null;
+  public skinColors: SkinColors = { hat: 0xd9534f, body: 0x3d5a40, pants: 0x2b2b2b };
   public connected = false;
   public peerCount = 0;
   public connectionError: string | null = null;
-  private firebaseApp: ReturnType<typeof initializeApp> | null = null;
   private saveTimer = 0;
+  // Track which IDs exist in Firebase to properly detect removals
+  private knownPlayerIds: Set<string> = new Set();
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -85,31 +89,24 @@ export class MultiplayerManager {
   public async connect() {
     if (this.connected) return;
     try {
-      // Use name-based stable ID so same name = same session
       this.myId = nameToId(this._myName);
-
       const appName = 'mistfall-mp-' + this.myId;
-      // Reuse existing app if already initialized
-      try {
-        this.firebaseApp = initializeApp(firebaseConfig, appName);
-      } catch {
-        // App already exists, get it
-        const { getApp } = await import('firebase/app');
-        this.firebaseApp = getApp(appName);
-      }
-      this.db = getDatabase(this.firebaseApp);
+      let app;
+      try { app = initializeApp(firebaseConfig, appName); }
+      catch { const { getApp } = await import('firebase/app'); app = getApp(appName); }
+      this.db = getDatabase(app);
 
-      // Check for existing saved session for this player name
+      // Restore saved session
       const sessionRef = ref(this.db, `sessions/${this.myId}`);
       const sessionSnap = await get(sessionRef);
       if (sessionSnap.exists()) {
         const saved = sessionSnap.val() as SavedSession;
-        // Only restore if session is less than 24 hours old
-        if (Date.now() - saved.timestamp < 86400000) {
-          if (this.onSessionLoaded) this.onSessionLoaded(saved);
+        if (Date.now() - saved.timestamp < 86400000 && this.onSessionLoaded) {
+          this.onSessionLoaded(saved);
         }
       }
 
+      // Register self
       const myRef = ref(this.db, `players/${this.myId}`);
       await set(myRef, {
         id: this.myId, name: this._myName,
@@ -118,31 +115,50 @@ export class MultiplayerManager {
       });
       onDisconnect(myRef).remove();
 
+      // USE ONLY onValue for players — it gives full snapshot each time
+      // This is the ONLY listener. No onChildAdded/onChildRemoved.
+      // This way we always have the authoritative list from Firebase.
       const playersRef = ref(this.db, 'players');
-      onChildAdded(playersRef, (snapshot) => {
-        const data = snapshot.val() as PlayerState;
-        if (data && data.id !== this.myId) this.addPeer(data);
-      });
-      onChildRemoved(playersRef, (snapshot) => {
-        const data = snapshot.val() as PlayerState;
-        if (data && data.id !== this.myId) this.removePeer(data.id);
-      });
       onValue(playersRef, (snapshot) => {
-        const data = snapshot.val();
-        if (!data) return;
+        const data = snapshot.val() || {};
+        const currentIds = new Set<string>();
         let count = 0;
+
+        // Add/update peers that exist in Firebase
         Object.keys(data).forEach(id => {
-          if (id !== this.myId) {
-            count++;
-            const playerData = data[id] as PlayerState;
-            const peer = this.peers.get(id);
-            if (peer) { peer.state = playerData; peer.lastUpdate = Date.now(); }
-            else this.addPeer(playerData);
+          if (id === this.myId) return;
+          currentIds.add(id);
+          count++;
+          const playerData = data[id] as PlayerState;
+
+          // Check if stale (timestamp > 10s old) — force remove from Firebase too
+          if (Date.now() - playerData.timestamp > 12000) {
+            // This player's data is stale, remove from Firebase
+            remove(ref(this.db!, `players/${id}`));
+            return;
+          }
+
+          const existing = this.peers.get(id);
+          if (existing) {
+            existing.state = playerData;
+            existing.lastUpdate = Date.now();
+          } else {
+            this.addPeer(playerData);
           }
         });
+
+        // Remove peers that are NO LONGER in Firebase
+        const toRemove: string[] = [];
+        for (const id of this.peers.keys()) {
+          if (!currentIds.has(id)) toRemove.push(id);
+        }
+        for (const id of toRemove) this.removePeer(id);
+
+        this.knownPlayerIds = currentIds;
         this.peerCount = count;
       });
 
+      // World events
       const eventsRef = ref(this.db, 'events');
       onChildAdded(eventsRef, (snapshot) => {
         const event = snapshot.val() as WorldEvent;
@@ -150,6 +166,7 @@ export class MultiplayerManager {
         if (event && Date.now() - event.timestamp > 5000) remove(snapshot.ref);
       });
 
+      // Sync broken items
       const brokenRef = ref(this.db, 'brokenItems');
       const brokenSnapshot = await get(brokenRef);
       if (brokenSnapshot.exists()) {
@@ -160,6 +177,7 @@ export class MultiplayerManager {
         });
       }
 
+      // Chat
       const chatRef = ref(this.db, 'chat');
       onChildAdded(chatRef, (snapshot) => {
         const msg = snapshot.val() as ChatMessage;
@@ -167,12 +185,24 @@ export class MultiplayerManager {
         if (msg && Date.now() - msg.timestamp > 60000) remove(snapshot.ref);
       });
 
+      // Time sync
       const timeRef = ref(this.db, 'worldTime');
       onValue(timeRef, (snapshot) => {
         const val = snapshot.val();
-        if (val && val.hostId !== this.myId && this.onTimeSync) {
-          this.onTimeSync(val.time);
+        if (val && val.hostId !== this.myId && this.onTimeSync) this.onTimeSync(val.time);
+      });
+
+      // PvP attacks
+      const pvpRef = ref(this.db, 'pvp');
+      onChildAdded(pvpRef, (snapshot) => {
+        const attack = snapshot.val();
+        if (!attack) return;
+        // Only process recent attacks aimed at me
+        if (attack.targetId === this.myId && Date.now() - attack.timestamp < 3000) {
+          if (this.onPlayerHit) this.onPlayerHit(attack.attackerId, attack.dmg || 10);
         }
+        // Clean old
+        if (Date.now() - attack.timestamp > 5000) remove(snapshot.ref);
       });
 
       this.connected = true;
@@ -184,11 +214,9 @@ export class MultiplayerManager {
     }
   }
 
-  // Save session to Firebase so rejoining with same name restores state
   public saveSession(state: { x: number; y: number; z: number; health: number; hunger: number; stamina: number; timeOfDay: number; inventory: Record<string, unknown> }) {
     if (!this.connected || !this.db) return;
-    const sessionRef = ref(this.db, `sessions/${this.myId}`);
-    set(sessionRef, { ...state, timestamp: Date.now() });
+    set(ref(this.db, `sessions/${this.myId}`), { ...state, timestamp: Date.now() });
   }
 
   private handleWorldEvent(event: WorldEvent) {
@@ -202,17 +230,22 @@ export class MultiplayerManager {
   private addPeer(data: PlayerState) {
     if (this.peers.has(data.id)) return;
     const rig = createPlayerModel();
-    const colors = [0x5a3d40, 0x3d405a, 0x5a5a3d, 0x3d5a5a, 0x5a3d5a, 0x4a5a3d];
-    const colorIdx = parseInt(data.id.replace(/\D/g, '').slice(0, 2) || '0') % colors.length;
+    const hatColor = data.skinHat || 0xd9534f;
+    const bodyColor = data.skinBody || 0x3d5a40;
+    const pantsColor = data.skinPants || 0x2b2b2b;
     rig.group.traverse((child) => {
       if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshLambertMaterial) {
         const m = child.material.clone();
-        m.color.lerp(new THREE.Color(colors[colorIdx]), 0.4);
+        const hex = m.color.getHex();
+        if (hex === 0xd9534f) m.color.setHex(hatColor);
+        else if (hex === 0x3d5a40 || hex === 0x2d4030) m.color.setHex(bodyColor);
+        else if (hex === 0x2b2b2b) m.color.setHex(pantsColor);
         child.material = m;
       }
     });
     rig.group.position.set(data.x, data.y, data.z);
     this.scene.add(rig.group);
+    // Name tag
     const canvas = document.createElement('canvas');
     canvas.width = 256; canvas.height = 64;
     const ctx = canvas.getContext('2d')!;
@@ -235,7 +268,19 @@ export class MultiplayerManager {
   private removePeer(id: string) {
     const peer = this.peers.get(id);
     if (peer) {
+      // Dispose all geometries/materials
+      peer.rig.group.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          child.geometry?.dispose();
+          if (child.material) {
+            if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+            else child.material.dispose();
+          }
+        }
+      });
       this.scene.remove(peer.rig.group);
+      const sprite = this.nameSprites.get(id);
+      if (sprite) { sprite.material.map?.dispose(); sprite.material.dispose(); }
       this.peers.delete(id);
       this.nameSprites.delete(id);
       this.peerCount = this.peers.size;
@@ -244,37 +289,38 @@ export class MultiplayerManager {
 
   public sendState(pos: THREE.Vector3, rot: number, health: number, tool: string, isAttacking: boolean) {
     if (!this.connected || !this.db) return;
-    const myRef = ref(this.db, `players/${this.myId}`);
-    set(myRef, {
+    set(ref(this.db, `players/${this.myId}`), {
       id: this.myId, name: this._myName,
       x: Math.round(pos.x * 100) / 100, y: Math.round(pos.y * 100) / 100,
       z: Math.round(pos.z * 100) / 100, rot: Math.round(rot * 100) / 100,
-      tool, isAttacking, health, timestamp: Date.now()
+      tool, isAttacking, health, timestamp: Date.now(),
+      skinHat: this.skinColors.hat, skinBody: this.skinColors.body, skinPants: this.skinColors.pants,
     });
+  }
+
+  public sendAttack(targetId: string, dmg: number) {
+    if (!this.connected || !this.db) return;
+    push(ref(this.db, 'pvp'), { attackerId: this.myId, targetId, dmg, timestamp: Date.now() });
   }
 
   public sendTimeSync(time: number) {
     if (!this.connected || !this.db) return;
     set(ref(this.db, 'worldTime'), { time, hostId: this.myId, timestamp: Date.now() });
   }
-
   public sendChatMessage(text: string) {
     if (!this.connected || !this.db) return;
     push(ref(this.db, 'chat'), { id: this.myId, sender: this._myName, text, timestamp: Date.now() });
   }
-
   public sendTreeBreak(itemId: string) {
     if (!this.connected || !this.db) return;
     set(ref(this.db, `brokenItems/${itemId}`), { timestamp: Date.now() });
     push(ref(this.db, 'events'), { type: 'treeBreak', itemId, playerId: this.myId, timestamp: Date.now() });
   }
-
   public sendRockBreak(itemId: string) {
     if (!this.connected || !this.db) return;
     set(ref(this.db, `brokenItems/${itemId}`), { timestamp: Date.now() });
     push(ref(this.db, 'events'), { type: 'rockBreak', itemId, playerId: this.myId, timestamp: Date.now() });
   }
-
   public sendPlaceItem(type: string, pos: THREE.Vector3) {
     if (!this.connected || !this.db) return;
     push(ref(this.db, 'events'), {
@@ -284,12 +330,35 @@ export class MultiplayerManager {
     });
   }
 
-  public update(delta: number, animTime: number) {
-    // Auto-save session every 10 seconds
-    this.saveTimer += delta;
+  // Admin: wipe entire server
+  public async resetServer() {
+    if (!this.db) return;
+    await set(ref(this.db, 'brokenItems'), null);
+    await set(ref(this.db, 'events'), null);
+    await set(ref(this.db, 'chat'), null);
+    await set(ref(this.db, 'pvp'), null);
+    await set(ref(this.db, 'sessions'), null);
+    await set(ref(this.db, 'worldTime'), null);
+    // Remove all players except self
+    const snap = await get(ref(this.db, 'players'));
+    if (snap.exists()) {
+      const all = snap.val();
+      for (const id of Object.keys(all)) {
+        if (id !== this.myId) await remove(ref(this.db, `players/${id}`));
+      }
+    }
+  }
 
-    for (const [id, peer] of this.peers) {
-      if (Date.now() - peer.lastUpdate > 15000) { this.removePeer(id); continue; }
+  // Admin: kick a specific player
+  public async kickPlayer(id: string) {
+    if (!this.db) return;
+    await remove(ref(this.db, `players/${id}`));
+    this.removePeer(id);
+  }
+
+  public update(delta: number, animTime: number) {
+    this.saveTimer += delta;
+    for (const [, peer] of this.peers) {
       const s = peer.state;
       const targetPos = new THREE.Vector3(s.x, s.y, s.z);
       peer.rig.group.position.lerp(targetPos, 0.12);
@@ -326,7 +395,10 @@ export class MultiplayerManager {
     off(ref(this.db, 'players'));
     off(ref(this.db, 'events'));
     off(ref(this.db, 'chat'));
-    for (const [id] of this.peers) this.removePeer(id);
+    off(ref(this.db, 'pvp'));
+    off(ref(this.db, 'worldTime'));
+    const peerIds = Array.from(this.peers.keys());
+    for (const id of peerIds) this.removePeer(id);
     this.connected = false; this.db = null;
   }
 
@@ -334,4 +406,9 @@ export class MultiplayerManager {
   public set playerName(n: string) { this._myName = n; this.myId = nameToId(n); }
   public get playerId() { return this.myId; }
   public get room() { return 'Mistfall World'; }
+  public getPeerList(): { id: string; name: string }[] {
+    const list: { id: string; name: string }[] = [];
+    for (const [id, peer] of this.peers) list.push({ id, name: peer.state.name });
+    return list;
+  }
 }
